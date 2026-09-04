@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Code Session-Bot (Telegram) — LXC 112
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude
+Group=claude
+WorkingDirectory=/home/claude
+EnvironmentFile=/home/claude/.config/telegram-session.env
+ExecStart=/usr/bin/node /home/claude/bin/telegram-session.mjs
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

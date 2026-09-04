@@ -1,1 +1,1 @@
-{"mcpServers": {"perm": {"command": "node", "args": ["/root/bin/permission-mcp.mjs"]}}}
+{"mcpServers":{"perm":{"command":"node","args":["/home/claude/bin/permission-mcp.mjs"]}}}

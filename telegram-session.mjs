@@ -3,14 +3,14 @@
 // Abgeleitet von AlphaGenX/claude-telegram-session-bot v6.1 (MIT), mit sechs Korrekturen:
 //   1. MODI.standard: "default" existiert nicht mehr -> "manual"
 //   2. CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT statt MCP_TOOL_TIMEOUT (der echte Killer)
-//   3. is_error wird geprueft — claude -p liefert bei API-Fehlern Exit 0 UND subtype:"success"
+//   3. is_error wird geprüft — claude -p liefert bei API-Fehlern Exit 0 UND subtype:"success"
 //   4. BOT_TOKEN/CHAT_ID werden aus der Claude-Subprozess-Env gestrippt
-//   5. Permission-Relay ueber Dateien statt direktem Telegram-Call im MCP (Token bleibt hier)
+//   5. Permission-Relay über Dateien statt direktem Telegram-Call im MCP (Token bleibt hier)
 //   6. Pfade auf User claude statt root
 // v8 (2026-09-05) — Ausbaustufen 1 und 2 aus dem Grill vom 2026-09-04:
 //   B1 /neu <repo> klont, registriert und startet in einem Zug; unscharfe Namenssuche
-//   B2 Branch + PR als Default fuer jedes Projekt, /direkt als Ausnahme pro Session
-//   B5 Warteschlange persistent, beim Start Rueckfrage mit Ein-Klick-Wiederaufnahme
+//   B2 Branch + PR als Default für jedes Projekt, /direkt als Ausnahme pro Session
+//   B5 Warteschlange persistent, beim Start Rückfrage mit Ein-Klick-Wiederaufnahme
 //   B6 Timeout 30 Min -> 2 h, Abbruch wird als Zwischenstand gemeldet
 //   B7 Capability-Ping an healthchecks.io (nur bei is_error: false)
 //   dazu /compact (verifiziert: komprimiert per --resume wirklich)
@@ -22,7 +22,7 @@ import { randomBytes } from "node:crypto";
 
 const TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = Number(process.env.CHAT_ID);
-if (!TOKEN || !CHAT_ID) { console.error("BOT_TOKEN und CHAT_ID muessen gesetzt sein"); process.exit(1); }
+if (!TOKEN || !CHAT_ID) { console.error("BOT_TOKEN und CHAT_ID müssen gesetzt sein"); process.exit(1); }
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
 const HOME = "/home/claude";
@@ -36,8 +36,8 @@ const WORK_ROOT = `${HOME}/work`;         // hier entstehen Projekte; /projekte 
 const CLAUDE = "/usr/bin/claude";
 const HOST = "192.168.1.139";
 const GH_USER = "lars-hh";
-// B6: 30 Min reichen fuer ein echtes Refactoring nicht. Ein Abbruch ist ein Zwischenstand,
-// kein Totalverlust — der Branch bleibt, der PR wird trotzdem geoeffnet.
+// B6: 30 Min reichen für ein echtes Refactoring nicht. Ein Abbruch ist ein Zwischenstand,
+// kein Totalverlust — der Branch bleibt, der PR wird trotzdem geöffnet.
 const RUN_TIMEOUT = 7200000;              // 2 h
 const REPO_CACHE_TTL = 6 * 3600 * 1000;   // 6 h
 // B7: Capability-Ping. Leer = unscharf; das wird laut protokolliert, nicht still verschluckt
@@ -59,8 +59,8 @@ const ENV = {
   PATH: `${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
 };
 
-// Korrektur 1: "default" ist als permission-mode nicht mehr gueltig.
-// Gueltig: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan
+// Korrektur 1: "default" ist als permission-mode nicht mehr gültig.
+// Gültig: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan
 const MODI = { standard: "manual", edits: "acceptEdits", plan: "plan", auto: "auto", voll: "bypassPermissions" };
 const modusName = (wert) => (Object.entries(MODI).find(([, v]) => v === (wert || DEFAULT_MODE)) || ["voll"])[0];
 
@@ -70,8 +70,8 @@ const modellName = (wert) => (Object.entries(MODELLE).find(([, v]) => v === wert
 const LEER = { sessions: [], aktiv: null, naechstesCwd: null, naechsterModus: null, naechstesModell: null, naechsterDirekt: false, warteschlange: [], laufend: null };
 const load = () => { try { return { ...LEER, ...JSON.parse(readFileSync(REG, "utf8")) }; } catch { return { ...LEER }; } };
 const save = (r) => writeFileSync(REG, JSON.stringify(r, null, 2), { mode: 0o600 });
-// Immer frisch laden, aendern, schreiben. pump() und die Nachrichtenschleife laufen
-// nebenlaeufig — ein festgehaltenes reg-Objekt wuerde die Warteschlange ueberschreiben.
+// Immer frisch laden, ändern, schreiben. pump() und die Nachrichtenschleife laufen
+// nebenläufig — ein festgehaltenes reg-Objekt würde die Warteschlange überschreiben.
 const mutate = (fn) => { const r = load(); const res = fn(r); save(r); return res; };
 const loadProj = () => { try { return JSON.parse(readFileSync(PROJ, "utf8")); } catch { return { work: DEFAULT_CWD }; } };
 const saveProj = (p) => writeFileSync(PROJ, JSON.stringify(p, null, 2), { mode: 0o600 });
@@ -81,7 +81,7 @@ const kurz = (cwd) => {
   return hit ? hit[0] : c.split("/").filter(Boolean).pop();
 };
 const wann = (t) => new Date(t).toLocaleString("de-DE", { timeZone: "Europe/Berlin", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
-const DAUER = "Antwort kommt meist unter einer Minute, groessere Auftraege brauchen laenger.";
+const DAUER = "Antwort kommt meist unter einer Minute, größere Aufträge brauchen länger.";
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const fehler = (...a) => console.error(new Date().toISOString(), ...a);
 
@@ -92,13 +92,68 @@ async function tg(method, body) {
   } catch (e) { fehler("TG:", (e && e.message) || e); return null; }
 }
 
+// ---------------------------------------------------------------------------
+// Markdown -> Telegram-HTML. Claude antwortet in Markdown; ohne parse_mode stehen
+// **Sternchen** und ## Rauten roh im Chat. HTML statt MarkdownV2, weil MarkdownV2
+// ein Dutzend Zeichen escapen verlangt und bei einem einzigen unbalancierten
+// Zeichen die ganze Nachricht ablehnt.
+// ---------------------------------------------------------------------------
+const esc = (x) => String(x).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+function mdZuHtml(s) {
+  const halde = [];
+  // Platzhalter mit NUL geklammert, nicht mit Leerzeichen: sonst würde beim
+  // Zurücksetzen auch normaler Text wie "in 5 Minuten" als Platzhalter gelesen.
+  const parken = (html) => { halde.push(html); return `\u0000${halde.length - 1}\u0000`; };
+  // Code zuerst herausnehmen, damit darin kein Markdown angewendet wird
+  s = String(s).replace(/```[a-zA-Z0-9_+-]*\n?([\s\S]*?)```/g, (m, code) => parken(`<pre><code>${esc(code.replace(/\n$/, ""))}</code></pre>`));
+  s = s.replace(/`([^`\n]+)`/g, (m, code) => parken(`<code>${esc(code)}</code>`));
+  s = esc(s);
+  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s.,;:!?)]|$)/g, "$1<i>$2</i>");
+  // Überschriften nach dem Fettdruck, sonst entsteht <b> in <b>
+  s = s.replace(/^[ \t]{0,3}#{1,6}[ \t]+(.+)$/gm, (m, t) => `<b>${t.replace(/<\/?b>/g, "").trim()}</b>`);
+  s = s.replace(/^([ \t]*)[-*+][ \t]+/gm, "$1• ");
+  return s.replace(/\u0000(\d+)\u0000/g, (m, i) => halde[Number(i)]);
+}
+
+// Ein halbes Tag am Stückende lässt Telegram die ganze Nachricht ablehnen.
+const ausgewogen = (h) => ["b", "i", "code", "pre", "a", "s", "u"].every((t) =>
+  (h.match(new RegExp(`<${t}(?:\\s[^>]*)?>`, "g")) || []).length === (h.match(new RegExp(`</${t}>`, "g")) || []).length);
+
+// An Zeilengrenzen teilen, damit Formatierung möglichst selten zerschnitten wird.
+function teilen(s, max) {
+  const raus = [];
+  let jetzt = "";
+  for (const zeile of String(s).split("\n")) {
+    if (zeile.length > max) {
+      if (jetzt) { raus.push(jetzt); jetzt = ""; }
+      for (let i = 0; i < zeile.length; i += max) raus.push(zeile.slice(i, i + max));
+      continue;
+    }
+    if (jetzt && (jetzt.length + 1 + zeile.length) > max) { raus.push(jetzt); jetzt = zeile; }
+    else jetzt = jetzt ? jetzt + "\n" + zeile : zeile;
+  }
+  if (jetzt) raus.push(jetzt);
+  return raus.length ? raus : [""];
+}
+
 async function send(text, extra) {
   let s = String(text ?? "").trim() || "(leere Antwort)";
-  if (s.length > 15200) s = s.slice(0, 15200) + "\n[gekuerzt]";
+  if (s.length > 15200) s = s.slice(0, 15200) + "\n[gekürzt]";
+  const stuecke = teilen(s, 3500);
   let letzte = null;
-  for (let i = 0; i < s.length; i += 3800) {
-    const istLetzte = i + 3800 >= s.length;
-    letzte = await tg("sendMessage", { chat_id: CHAT_ID, text: s.slice(i, i + 3800), ...(istLetzte ? extra || {} : {}) });
+  for (let i = 0; i < stuecke.length; i++) {
+    const zusatz = i === stuecke.length - 1 ? extra || {} : {};
+    const html = mdZuHtml(stuecke[i]);
+    if (ausgewogen(html)) {
+      letzte = await tg("sendMessage", { chat_id: CHAT_ID, text: html, parse_mode: "HTML", link_preview_options: { is_disabled: true }, ...zusatz });
+      if (letzte?.ok) continue;
+      fehler("HTML abgelehnt, sende roh:", (letzte && letzte.description) || "");
+    }
+    // Fallback: lieber unformatiert ankommen als formatiert verschwinden
+    letzte = await tg("sendMessage", { chat_id: CHAT_ID, text: stuecke[i], ...zusatz });
   }
   return letzte;
 }
@@ -124,7 +179,7 @@ const istGit = (cwd) => { try { return existsSync(`${cwd}/.git`); } catch { retu
 const kurzId = () => randomBytes(3).toString("hex");
 
 // ---------------------------------------------------------------------------
-// Wartende Entscheidungen (Buttons). Ein Mechanismus fuer drei Faelle:
+// Wartende Entscheidungen (Buttons). Ein Mechanismus für drei Fälle:
 // mehrdeutiger Repo-Name, schmutziger Klon, verlorene Warteschlange.
 // ---------------------------------------------------------------------------
 const wartend = new Map(); // id -> { typ, ...daten, ts }
@@ -138,7 +193,7 @@ const knopf = (text, id, wahl) => ({ text, callback_data: `act:${id}:${wahl}` })
 
 // ---------------------------------------------------------------------------
 // Korrektur 5: Permission-Relay. Der MCP legt <id>.req ab und kennt keinen Token.
-// Dieser Watcher verschickt die Anfrage und schreibt die Antwort als <id> zurueck.
+// Dieser Watcher verschickt die Anfrage und schreibt die Antwort als <id> zurück.
 // ---------------------------------------------------------------------------
 const permMsg = new Map(); // id -> message_id
 async function permWatch() {
@@ -222,18 +277,18 @@ async function repoKatalog(erzwingen = false) {
   return repos;
 }
 
-// Sucht ueber registrierte Projekte UND eigene GitHub-Repos.
+// Sucht über registrierte Projekte UND eigene GitHub-Repos.
 // Ergebnis: { art: "treffer"|"mehrdeutig"|"nichts", ... }
 async function zielFinden(anfrage) {
   const projekte = loadProj();
-  const kandidaten = new Map(); // schluessel -> { name, punkte, quelle, pfad? }
+  const kandidaten = new Map(); // schlüssel -> { name, punkte, quelle, pfad? }
   const merke = (name, p, quelle, pfad) => {
     const alt = kandidaten.get(norm(name));
     if (!alt || alt.punkte < p) kandidaten.set(norm(name), { name, punkte: p, quelle, pfad });
   };
   for (const [name, pfad] of Object.entries(projekte)) {
     const p = punkte(anfrage, name);
-    if (p) merke(name, Math.min(100, p + 4), "projekt", pfad); // registriert schlaegt ungeklont
+    if (p) merke(name, Math.min(100, p + 4), "projekt", pfad); // registriert schlägt ungeklont
   }
   for (const repo of await repoKatalog()) {
     const p = punkte(anfrage, repo.name);
@@ -265,7 +320,7 @@ async function zielBereitstellen(ziel) {
   return { ok: true, pfad, name };
 }
 
-// Prueft den vorhandenen Klon. Meldet handlungsfaehig statt nur zu berichten.
+// Prüft den vorhandenen Klon. Meldet handlungsfähig statt nur zu berichten.
 async function klonPruefen(pfad) {
   if (!istGit(pfad)) return { art: "ok", hinweis: "" };
   const st = await git(pfad, "status", "--porcelain");
@@ -295,8 +350,8 @@ const stempel = () => {
 };
 
 const branchHinweis = (bi) => `[Bot-Hinweis] Du arbeitest im Git-Branch "${bi.branch}" (Basis "${bi.base}"). `
-  + `Committe alle Aenderungen in diesem Branch mit aussagekraeftigen Nachrichten. Wechsle den Branch nicht, `
-  + `mache kein git push und erstelle keinen Pull Request — das uebernimmt der Bot nach deinem Lauf.\n\nAuftrag:\n`;
+  + `Committe alle Änderungen in diesem Branch mit aussagekräftigen Nachrichten. Wechsle den Branch nicht, `
+  + `mache kein git push und erstelle keinen Pull Request — das übernimmt der Bot nach deinem Lauf.\n\nAuftrag:\n`;
 
 // Legt den Branch an bzw. stellt sicher, dass wir noch auf dem der Session sind.
 async function branchVorbereiten(cwd, vorhanden, auftrag) {
@@ -306,12 +361,12 @@ async function branchVorbereiten(cwd, vorhanden, auftrag) {
     if (jetzt === vorhanden.branch) return { branch: vorhanden.branch, base: vorhanden.base, meldung: "" };
     const co = await git(cwd, "checkout", vorhanden.branch);
     if (co.ok) return { branch: vorhanden.branch, base: vorhanden.base, meldung: "" };
-    return { branch: null, meldung: `Konnte nicht auf Branch ${vorhanden.branch} zurueck (${(co.err || "").split("\n")[0].slice(0, 140)}). Der Auftrag laeuft auf ${jetzt}.` };
+    return { branch: null, meldung: `Konnte nicht auf Branch ${vorhanden.branch} zurück (${(co.err || "").split("\n")[0].slice(0, 140)}). Der Auftrag läuft auf ${jetzt}.` };
   }
   const base = (await git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).out || "main";
   const branch = `claude/${slug(auftrag)}-${stempel()}`;
   const co = await git(cwd, "checkout", "-b", branch);
-  if (!co.ok) return { branch: null, meldung: `Branch ${branch} konnte nicht angelegt werden (${(co.err || "").split("\n")[0].slice(0, 140)}). Der Auftrag laeuft direkt auf ${base}.` };
+  if (!co.ok) return { branch: null, meldung: `Branch ${branch} konnte nicht angelegt werden (${(co.err || "").split("\n")[0].slice(0, 140)}). Der Auftrag läuft direkt auf ${base}.` };
   return { branch, base, meldung: "" };
 }
 
@@ -323,7 +378,7 @@ function repoAusRemote(url) {
   return m ? `${m[1]}/${m[2]}` : null;
 }
 
-// Nach dem Lauf: pushen und PR oeffnen, wenn es Commits gibt. Laeuft auch nach
+// Nach dem Lauf: pushen und PR öffnen, wenn es Commits gibt. Läuft auch nach
 // einem Abbruch — genau dann ist der PR der Zwischenstand.
 async function prAbschluss(cwd, bi, titel, auftrag) {
   if (!bi?.branch || !istGit(cwd)) return null;
@@ -333,6 +388,13 @@ async function prAbschluss(cwd, bi, titel, auftrag) {
     const st = await git(cwd, "status", "--porcelain");
     const n = st.out ? st.out.split("\n").filter(Boolean).length : 0;
     if (n) return { text: `Kein Commit im Branch ${bi.branch}, aber ${n === 1 ? "eine geaenderte Datei liegt" : `${n} geaenderte Dateien liegen`} dort. Mit einem neuen Auftrag in derselben Session fortsetzen.` };
+    // Nichts ist passiert — dann bleibt auch kein Branch stehen. Eine reine Frage
+    // ("was sind die nächsten Schritte?") soll das Repo nicht mit einem leeren
+    // Branch belasten, der ihren Wortlaut im Namen trägt.
+    if (bi.base) {
+      const zurueck = await git(cwd, "checkout", bi.base);
+      if (zurueck.ok) { await git(cwd, "branch", "-D", bi.branch); return { verworfen: true }; }
+    }
     return null;
   }
   const commits = anzahl === 1 ? "1 Commit" : `${anzahl} Commits`;
@@ -355,7 +417,7 @@ async function prAbschluss(cwd, bi, titel, auftrag) {
 }
 
 // ---------------------------------------------------------------------------
-// Claude ausfuehren
+// Claude ausführen
 // ---------------------------------------------------------------------------
 function runClaude(auftrag, resumeId, cwd, modus, modell) {
   return new Promise((resolve) => {
@@ -376,7 +438,7 @@ function runClaude(auftrag, resumeId, cwd, modus, modell) {
       try { j = JSON.parse(out); }
       catch { return resolve({ ok: false, error: "Antwort nicht lesbar: " + String(out).slice(0, 300) }); }
       // Korrektur 3: claude -p meldet API-Fehler mit Exit 0 UND subtype:"success".
-      // Nur is_error ist verlaesslich — sonst landet z.B. "OAuth session expired"
+      // Nur is_error ist verlässlich — sonst landet z.B. "OAuth session expired"
       // als vermeintliche Claude-Antwort im Chat und der Bot wirkt monatelang gesund.
       if (j.is_error === true) {
         const grund = j.result || j.api_error_status || j.terminal_reason || "unbekannter API-Fehler";
@@ -427,7 +489,7 @@ async function auftragAusfuehren(item) {
   const modell = cur ? (cur.modell || null) : (reg.naechstesModell || null);
   const direkt = cur ? !!cur.direkt : !!reg.naechsterDirekt;
 
-  // B2: Branch anlegen, bevor Claude laeuft — dann kann main auch dann nicht
+  // B2: Branch anlegen, bevor Claude läuft — dann kann main auch dann nicht
   // getroffen werden, wenn Claude den Hinweis im Prompt ignoriert.
   let bi = { branch: null, base: null, prUrl: cur?.prUrl || null };
   if (!direkt) {
@@ -461,10 +523,12 @@ async function auftragAusfuehren(item) {
   else if (r.abbruch) await send(`${r.error}\nDas ist ein Zwischenstand, kein Totalverlust: die Arbeit liegt in ${cwd}${bi.branch ? ` im Branch ${bi.branch}` : ""}. Mit einem neuen Auftrag im selben Projekt geht es weiter.`);
   else await send("Fehlgeschlagen: " + r.error);
 
-  // B6: der PR-Abschluss laeuft auch nach Abbruch und Fehler — genau dann ist er wertvoll.
+  // B6: der PR-Abschluss läuft auch nach Abbruch und Fehler — genau dann ist er wertvoll.
   try {
     const pr = await prAbschluss(cwd, bi, item.text, item.text);
-    if (pr) {
+    if (pr?.verworfen) {
+      mutate((reg3) => { const s = reg3.sessions.find((x) => x.id === (sid || reg3.aktiv)); if (s) { s.branch = null; s.base = null; } });
+    } else if (pr) {
       await send(pr.text);
       if (pr.prUrl) mutate((reg3) => { const s = reg3.sessions.find((x) => x.id === (sid || reg3.aktiv)); if (s) s.prUrl = pr.prUrl; });
     }
@@ -472,8 +536,8 @@ async function auftragAusfuehren(item) {
 }
 
 // ---------------------------------------------------------------------------
-// B7: Capability-Ping. Die Faehigkeit pingen, nicht die Existenz — der Dienst
-// lief am 2026-09-04 monatelang, waehrend nur der Login tot war.
+// B7: Capability-Ping. Die Fähigkeit pingen, nicht die Existenz — der Dienst
+// lief am 2026-09-04 monatelang, während nur der Login tot war.
 // ---------------------------------------------------------------------------
 const hc = { letzterOk: null, letzterVersuch: null, letzterFehler: null, unscharfGemeldet: false };
 
@@ -517,7 +581,7 @@ function grenzen(pfad) {
 }
 
 // ---------------------------------------------------------------------------
-// Auftrag einreihen (gemeinsamer Weg fuer /neu und freie Nachrichten)
+// Auftrag einreihen (gemeinsamer Weg für /neu und freie Nachrichten)
 // ---------------------------------------------------------------------------
 async function einreihen(text, cwd, meldungWennFrei) {
   const pos = qPush({ qid: kurzId(), text, cwd: cwd || null, ts: Date.now() });
@@ -530,8 +594,8 @@ async function neuStarten(pfad, name, auftrag, hinweis) {
   const reg = load();
   const wie = reg.naechsterDirekt ? "direkt auf dem Hauptbranch" : "auf einem eigenen Branch mit PR";
   const kopf = (hinweis ? hinweis + "\n" : "") + `Neue Session in ${name} (${pfad}), ${wie}.`;
-  if (auftrag) await einreihen(auftrag, pfad, `${kopf} Auftrag laeuft. ${DAUER}`);
-  else await send(`${kopf}\nDeine naechste Nachricht eroeffnet sie.`);
+  if (auftrag) await einreihen(auftrag, pfad, `${kopf} Auftrag läuft. ${DAUER}`);
+  else await send(`${kopf}\nDeine nächste Nachricht eröffnet sie.`);
 }
 
 // Der gemeinsame Weg von "/neu <name>" bis zum laufenden Auftrag.
@@ -543,10 +607,10 @@ async function zielOeffnen(ziel, auftrag, vorHinweis) {
     const id = frage({ typ: "dirty", pfad: b.pfad, name: b.name, auftrag: auftrag || "", vorHinweis: vorHinweis || "" });
     const liste = pruef.dateien.slice(0, 8).map((z) => "  " + z).join("\n");
     await send(
-      `${b.name} hat ${pruef.dateien.length} ungespeicherte Aenderung(en) im Klon auf dem Server:\n${liste}${pruef.dateien.length > 8 ? "\n  ..." : ""}\n\n`
+      `${b.name} hat ${pruef.dateien.length} ungespeicherte Änderung(en) im Klon auf dem Server:\n${liste}${pruef.dateien.length > 8 ? "\n  ..." : ""}\n\n`
       + `Ich habe deshalb nicht gepullt. Wie weiter?`,
       { reply_markup: { inline_keyboard: [
-        [knopf("Aenderungen behalten und weiter", id, "weiter")],
+        [knopf("Änderungen behalten und weiter", id, "weiter")],
         [knopf("Wegstashen und frisch ziehen", id, "stash")],
         [knopf("Verwerfen und frisch ziehen", id, "reset")],
         [knopf("Abbrechen", id, "abbruch")],
@@ -567,7 +631,7 @@ async function verloreneAuftraege() {
   const id = frage({ typ: "queue", items: offen });
   const liste = offen.map((x, i) => `${i + 1}. ${String(x.text).slice(0, 90)}`).join("\n");
   await send(
-    `Beim letzten Stopp waren ${offen.length} Auftraege offen — sie wurden nicht ausgefuehrt:\n${liste}\n\n`
+    `Beim letzten Stopp waren ${offen.length} Aufträge offen — sie wurden nicht ausgeführt:\n${liste}\n\n`
     + `${r.laufend ? "Der erste lief bereits, seine Arbeit kann teilweise auf der Platte liegen.\n" : ""}Was soll damit passieren?`,
     { reply_markup: { inline_keyboard: [
       [knopf("Alle erneut einreihen", id, "alle")],
@@ -578,14 +642,33 @@ async function verloreneAuftraege() {
 // ---------------------------------------------------------------------------
 // Hauptschleife
 // ---------------------------------------------------------------------------
+// Das Befehlsmenü im Chat (blauer Knopf links neben der Eingabe) kommt nicht von
+// allein — Telegram zeigt es erst, wenn der Bot seine Befehle einmal angemeldet hat.
+const BEFEHLE = [
+  { command: "neu", description: "Projekt öffnen: klont, registriert und startet in einem Zug" },
+  { command: "status", description: "Stand, Verzeichnis, Branch, PR, Außenwache" },
+  { command: "sessions", description: "Alle Sessions mit Projekt und Branch" },
+  { command: "wechsel", description: "Session wechseln (/wechsel 2)" },
+  { command: "direkt", description: "Direkt auf dem Hauptbranch statt Branch + PR" },
+  { command: "compact", description: "Kontext der aktiven Session verdichten" },
+  { command: "clear", description: "Kontext leeren, Projekt behalten" },
+  { command: "ende", description: "Aktive Session ablegen" },
+  { command: "projekte", description: "Verzeichnisse zeigen, registrieren, Repo-Liste neu einlesen" },
+  { command: "modus", description: "Berechtigungsmodus (standard, edits, plan, auto, voll)" },
+  { command: "modell", description: "Sprachmodell (opus, sonnet, haiku, standard)" },
+  { command: "start", description: "Hilfe anzeigen" },
+];
+
 let offset = 0;
 log(`Session-Bot v8 gestartet (LXC 112, User claude). Capability-Ping: ${HC_URL ? "scharf" : "UNSCHARF (HC_URL fehlt)"}`);
+const menue = await tg("setMyCommands", { commands: BEFEHLE });
+if (!menue?.ok) fehler("Befehlsmenü konnte nicht gesetzt werden:", (menue && menue.description) || "");
 await verloreneAuftraege();
 
 const HILFE = "Session-Bot bereit (LXC 112). Jede Nachricht ist ein Auftrag an die aktive Claude-Session.\n\n"
   + "/neu <repo|projekt|/pfad> [Auftrag] - klont bei Bedarf, registriert und startet in einem Zug; der Name darf unscharf sein\n"
-  + "/projekte - Verzeichnisse zeigen, mit add registrieren, mit scan uebernehmen\n"
-  + "/direkt [aus] - fuer diese Session direkt auf dem Hauptbranch statt Branch+PR\n"
+  + "/projekte - Verzeichnisse zeigen, mit add registrieren, mit scan übernehmen\n"
+  + "/direkt [aus] - für diese Session direkt auf dem Hauptbranch statt Branch+PR\n"
   + "/compact - Kontext der aktiven Session verdichten\n"
   + "/modus [standard|edits|plan|auto|voll] - Berechtigungsmodus\n"
   + "/modell [opus|sonnet|haiku|standard] - Sprachmodell\n"
@@ -594,7 +677,7 @@ const HILFE = "Session-Bot bereit (LXC 112). Jede Nachricht ist ein Auftrag an d
   + "/status - Stand plus SSH-Befehl zum Fortsetzen\n"
   + "/clear - Kontext leeren\n"
   + "/ende - aktive Session ablegen\n\n"
-  + "Standard ist Branch + Pull Request: der Bot legt vor dem Lauf einen Branch an und oeffnet danach den PR. "
+  + "Standard ist Branch + Pull Request: der Bot legt vor dem Lauf einen Branch an und öffnet danach den PR. "
   + "Web-Suche ist erlaubt. Braucht Claude weitere Rechte, kommt eine Freigabe-Anfrage mit Buttons. " + DAUER;
 
 while (true) {
@@ -619,7 +702,7 @@ while (true) {
               if (cq.message) {
                 const orig = cq.message.text || "Berechtigungsanfrage";
                 await tg("editMessageText", { chat_id: CHAT_ID, message_id: cq.message.message_id,
-                  text: ((antwort === "ja" ? "ERLAUBT - Claude fuehrt aus:\n" : "ABGELEHNT - Claude ueberspringt:\n") + orig).slice(0, 4000) });
+                  text: ((antwort === "ja" ? "ERLAUBT - Claude führt aus:\n" : "ABGELEHNT - Claude überspringt:\n") + orig).slice(0, 4000) });
               }
             } catch (e) { fehler("Perm:", (e && e.message) || e); note = "Fehler"; }
           }
@@ -634,28 +717,28 @@ while (true) {
             if (akt.typ === "queue") {
               if (wahl === "alle") {
                 for (const it of akt.items) qPush({ ...it, qid: kurzId() });
-                await send(`${akt.items.length} Auftraege wieder eingereiht.`);
+                await send(`${akt.items.length} Aufträge wieder eingereiht.`);
                 pump();
               } else await send("Verworfen.");
             } else if (akt.typ === "wahl") {
               const ziel = akt.liste[parseInt(wahl, 10)];
-              if (!ziel) await send("Auswahl nicht mehr gueltig.");
-              else await zielOeffnen(ziel, akt.auftrag, `Gewaehlt: ${ziel.name}.`);
+              if (!ziel) await send("Auswahl nicht mehr gültig.");
+              else await zielOeffnen(ziel, akt.auftrag, `Gewählt: ${ziel.name}.`);
             } else if (akt.typ === "dirty") {
-              if (wahl === "abbruch") { await send("Abgebrochen. Der Klon bleibt unveraendert."); }
+              if (wahl === "abbruch") { await send("Abgebrochen. Der Klon bleibt unverändert."); }
               else {
                 let hinweis = akt.vorHinweis || "";
                 if (wahl === "stash") {
                   const s = await git(akt.pfad, "stash", "push", "-u", "-m", `bot ${new Date().toISOString()}`);
-                  hinweis += (hinweis ? "\n" : "") + (s.ok ? "Aenderungen gestasht (git stash list zeigt sie)." : `Stash fehlgeschlagen: ${(s.err || "").split("\n")[0].slice(0, 140)}`);
+                  hinweis += (hinweis ? "\n" : "") + (s.ok ? "Änderungen gestasht (git stash list zeigt sie)." : `Stash fehlgeschlagen: ${(s.err || "").split("\n")[0].slice(0, 140)}`);
                   if (s.ok) { const p = await klonPruefen(akt.pfad); if (p.hinweis) hinweis += "\n" + p.hinweis; }
                 } else if (wahl === "reset") {
                   await git(akt.pfad, "reset", "--hard");
                   await git(akt.pfad, "clean", "-fd");
-                  hinweis += (hinweis ? "\n" : "") + "Lokale Aenderungen verworfen.";
+                  hinweis += (hinweis ? "\n" : "") + "Lokale Änderungen verworfen.";
                   const p = await klonPruefen(akt.pfad); if (p.hinweis) hinweis += "\n" + p.hinweis;
                 } else {
-                  hinweis += (hinweis ? "\n" : "") + "Die lokalen Aenderungen bleiben stehen, es wurde nicht gepullt.";
+                  hinweis += (hinweis ? "\n" : "") + "Die lokalen Änderungen bleiben stehen, es wurde nicht gepullt.";
                 }
                 await neuStarten(akt.pfad, akt.name, akt.auftrag, hinweis);
               }
@@ -678,14 +761,14 @@ while (true) {
         const aus = text.slice(7).trim().toLowerCase() === "aus";
         if (cur) {
           if (!aus && cur.branch) {
-            await send(`Diese Session arbeitet bereits im Branch ${cur.branch}. /direkt gilt ab der naechsten neuen Session — sonst waere der halbfertige Branch verwaist.`);
+            await send(`Diese Session arbeitet bereits im Branch ${cur.branch}. /direkt gilt ab der nächsten neuen Session — sonst wäre der halbfertige Branch verwaist.`);
             continue;
           }
           mutate((r) => { const s = r.sessions.find((x) => x.id === cur.id); if (s) s.direkt = !aus; });
           await send(aus ? `"${cur.titel}" arbeitet wieder mit Branch + PR.` : `"${cur.titel}" arbeitet ab jetzt direkt auf dem Hauptbranch. Kein PR, kein Diff zum Gegenlesen.`);
         } else {
           mutate((r) => { r.naechsterDirekt = !aus; });
-          await send(aus ? "Naechste Session: Branch + PR (Standard)." : "Naechste Session: direkt auf dem Hauptbranch. Kein PR, kein Diff zum Gegenlesen.");
+          await send(aus ? "Nächste Session: Branch + PR (Standard)." : "Nächste Session: direkt auf dem Hauptbranch. Kein PR, kein Diff zum Gegenlesen.");
         }
         continue;
       }
@@ -699,27 +782,27 @@ while (true) {
         if (!r.ok) { await send("Verdichten fehlgeschlagen: " + r.error); continue; }
         const nachher = grenzen(pfad);
         mutate((x) => { const s = x.sessions.find((y) => y.id === cur.id); if (s) s.zuletzt = Date.now(); });
-        if (vorher >= 0 && nachher > vorher) await send(`Kontext verdichtet. Die Session laeuft unter derselben ID weiter, das Wissen aus den frueheren Nachrichten bleibt als Zusammenfassung erhalten.`);
-        else if (vorher >= 0 && nachher === vorher) await send("Claude hat den Befehl angenommen, im Transkript ist aber keine neue Verdichtung entstanden — vermutlich war der Kontext dafuer noch zu klein.");
-        else await send("Verdichtung ausgefuehrt. (Transkript nicht auffindbar, deshalb ohne Gegenprobe.)");
+        if (vorher >= 0 && nachher > vorher) await send(`Kontext verdichtet. Die Session läuft unter derselben ID weiter, das Wissen aus den früheren Nachrichten bleibt als Zusammenfassung erhalten.`);
+        else if (vorher >= 0 && nachher === vorher) await send("Claude hat den Befehl angenommen, im Transkript ist aber keine neue Verdichtung entstanden — vermutlich war der Kontext dafür noch zu klein.");
+        else await send("Verdichtung ausgeführt. (Transkript nicht auffindbar, deshalb ohne Gegenprobe.)");
         continue;
       }
 
       if (text === "/modus" || text.startsWith("/modus ")) {
         const arg = text.slice(6).trim().toLowerCase();
         if (!arg) {
-          await send(`Aktueller Modus${cur ? ` der Session "${cur.titel}"` : " fuer die naechste Session"}: ${cur ? modusName(cur.modus) : modusName(reg.naechsterModus)}\n\nVerfuegbar:\nstandard - fragt per Button an, auch bei Dateiaenderungen\nedits - Dateiaenderungen automatisch, Rest per Button\nplan - nur lesen und planen\nauto - Claude entscheidet selbst\nvoll - keine Nachfragen (STANDARD auf dieser Maschine)\n\nHinweis: "edits" genehmigt auch rm, mv, cp und sed im Arbeitsverzeichnis automatisch.`);
+          await send(`Aktueller Modus${cur ? ` der Session "${cur.titel}"` : " fuer die naechste Session"}: ${cur ? modusName(cur.modus) : modusName(reg.naechsterModus)}\n\nVerfügbar:\nstandard - fragt per Button an, auch bei Dateiänderungen\nedits - Dateiänderungen automatisch, Rest per Button\nplan - nur lesen und planen\nauto - Claude entscheidet selbst\nvoll - keine Nachfragen (STANDARD auf dieser Maschine)\n\nHinweis: "edits" genehmigt auch rm, mv, cp und sed im Arbeitsverzeichnis automatisch.`);
         } else if (!MODI[arg]) {
-          await send("Unbekannter Modus. Verfuegbar: standard, edits, plan, auto, voll");
+          await send("Unbekannter Modus. Verfügbar: standard, edits, plan, auto, voll");
         } else {
           const warn = arg === "voll" ? "\nVorsicht: Claude fragt in dieser Session nichts mehr an."
                      : arg === "edits" ? "\nHinweis: genehmigt auch rm/mv/cp/sed im Arbeitsverzeichnis." : "";
           if (cur) {
             mutate((r) => { const s = r.sessions.find((x) => x.id === cur.id); if (s) s.modus = MODI[arg]; });
-            await send(`Modus fuer "${cur.titel}": ${arg}${warn}`);
+            await send(`Modus für "${cur.titel}": ${arg}${warn}`);
           } else {
             mutate((r) => { r.naechsterModus = MODI[arg]; });
-            await send(`Modus fuer die naechste Session: ${arg}${warn}`);
+            await send(`Modus für die nächste Session: ${arg}${warn}`);
           }
         }
         continue;
@@ -727,15 +810,15 @@ while (true) {
       if (text === "/modell" || text.startsWith("/modell ")) {
         const arg = text.slice(7).trim().toLowerCase();
         if (!arg) {
-          await send(`Aktuelles Modell${cur ? ` der Session "${cur.titel}"` : " fuer die naechste Session"}: ${cur ? modellName(cur.modell) : modellName(reg.naechstesModell)}\n\nVerfuegbar: opus, sonnet, haiku, standard`);
+          await send(`Aktuelles Modell${cur ? ` der Session "${cur.titel}"` : " fuer die naechste Session"}: ${cur ? modellName(cur.modell) : modellName(reg.naechstesModell)}\n\nVerfügbar: opus, sonnet, haiku, standard`);
         } else if (arg !== "standard" && !MODELLE[arg]) {
-          await send("Unbekanntes Modell. Verfuegbar: opus, sonnet, haiku, standard");
+          await send("Unbekanntes Modell. Verfügbar: opus, sonnet, haiku, standard");
         } else {
           const wert = arg === "standard" ? null : MODELLE[arg];
           if (cur) {
             mutate((r) => { const s = r.sessions.find((x) => x.id === cur.id); if (s) s.modell = wert; });
-            await send(`Modell fuer "${cur.titel}": ${arg}`);
-          } else { mutate((r) => { r.naechstesModell = wert; }); await send(`Modell fuer die naechste Session: ${arg}`); }
+            await send(`Modell für "${cur.titel}": ${arg}`);
+          } else { mutate((r) => { r.naechstesModell = wert; }); await send(`Modell für die nächste Session: ${arg}`); }
         }
         continue;
       }
@@ -774,7 +857,7 @@ while (true) {
           const p = loadProj();
           const neu = unregistriert();
           let t = "Projekte:\n" + Object.entries(p).map(([k, v]) => `${k} -> ${v}`).join("\n");
-          if (neu.length) t += `\n\nNoch nicht registriert (in ${WORK_ROOT}):\n` + neu.map((pf) => "  " + pf.split("/").pop()).join("\n") + "\n\nAlle uebernehmen: /projekte scan";
+          if (neu.length) t += `\n\nNoch nicht registriert (in ${WORK_ROOT}):\n` + neu.map((pf) => "  " + pf.split("/").pop()).join("\n") + "\n\nAlle übernehmen: /projekte scan";
           t += "\n\nEinzeln: /projekte add name [pfad]  (ohne Pfad = " + WORK_ROOT + "/name)";
           t += "\nNeues Repo holen: /neu <reponame> [Auftrag] — klont selbst, der Name darf unscharf sein.";
           t += "\nRepo-Liste neu einlesen: /projekte repos";
@@ -796,10 +879,10 @@ while (true) {
         continue;
       }
       if (text === "/status") {
-        const lage = busy ? `Ein Auftrag laeuft gerade${queue.length ? `, ${queue.length} in Warteschlange` : ""}.` : queue.length ? `${queue.length} in Warteschlange.` : "Bereit.";
-        const wacht = !HC_URL ? "Aussenwache: UNSCHARF (HC_URL nicht gesetzt) — ein Ausfall faellt niemandem auf."
-          : hc.letzterFehler ? `Aussenwache: FEHLER (${hc.letzterFehler.slice(0, 120)}), zuletzt ok ${hc.letzterOk ? wann(hc.letzterOk) : "nie"}`
-          : `Aussenwache: scharf, letzter erfolgreicher Faehigkeits-Test ${hc.letzterOk ? wann(hc.letzterOk) : "steht noch aus"}`;
+        const lage = busy ? `Ein Auftrag läuft gerade${queue.length ? `, ${queue.length} in Warteschlange` : ""}.` : queue.length ? `${queue.length} in Warteschlange.` : "Bereit.";
+        const wacht = !HC_URL ? "Außenwache: UNSCHARF (HC_URL nicht gesetzt) — ein Ausfall fällt niemandem auf."
+          : hc.letzterFehler ? `Außenwache: FEHLER (${hc.letzterFehler.slice(0, 120)}), zuletzt ok ${hc.letzterOk ? wann(hc.letzterOk) : "nie"}`
+          : `Außenwache: scharf, letzter erfolgreicher Fähigkeits-Test ${hc.letzterOk ? wann(hc.letzterOk) : "steht noch aus"}`;
         if (cur) await send(`Aktive Session: ${cur.titel}\nVerzeichnis: ${cur.cwd || DEFAULT_CWD}\nModus: ${modusName(cur.modus)}\nModell: ${modellName(cur.modell)}\nArbeitsweise: ${cur.direkt ? "direkt auf dem Hauptbranch" : `Branch + PR${cur.branch ? ` (${cur.branch})` : ""}`}${cur.prUrl ? `\nPR: ${cur.prUrl}` : ""}\nZuletzt: ${wann(cur.zuletzt)}\n${lage}\n${wacht}\n\nAm Rechner fortsetzen:\nssh -i ~/.ssh/claude_proxmox root@${HOST}\nsu - claude\ncd "${cur.cwd || DEFAULT_CWD}" && claude --resume ${cur.id}`);
         else await send(`Keine aktive Session. ${lage}\n${wacht}`);
         continue;
@@ -811,7 +894,7 @@ while (true) {
           r.aktiv = null; r.naechstesCwd = cur.cwd || DEFAULT_CWD; r.naechsterModus = cur.modus || null;
           r.naechstesModell = cur.modell || null; r.naechsterDirekt = !!cur.direkt;
         });
-        await send(`Kontext geleert. Deine naechste Nachricht startet frisch in ${kurz(cur.cwd)} (Modus ${modusName(cur.modus)}).${cur.branch ? `\nDer Branch ${cur.branch} bleibt stehen; die neue Session legt einen eigenen an.` : ""}`);
+        await send(`Kontext geleert. Deine nächste Nachricht startet frisch in ${kurz(cur.cwd)} (Modus ${modusName(cur.modus)}).${cur.branch ? `\nDer Branch ${cur.branch} bleibt stehen; die neue Session legt einen eigenen an.` : ""}`);
         continue;
       }
       if (text === "/ende") {
@@ -826,7 +909,7 @@ while (true) {
         const rest = text.slice(4).trim();
         if (!rest) {
           mutate((r) => { r.aktiv = null; r.naechstesCwd = null; });
-          await send(`Alles klar, deine naechste Nachricht eroeffnet eine neue Session in ${kurz(null)}.`);
+          await send(`Alles klar, deine nächste Nachricht eröffnet eine neue Session in ${kurz(null)}.`);
           continue;
         }
         const erst = rest.split(/\s+/)[0];
@@ -853,15 +936,15 @@ while (true) {
             reply_markup: { inline_keyboard: t.liste.map((x, i) => [knopf(`${x.name}${x.quelle === "projekt" ? " (schon da)" : ""}`, id, String(i))]) },
           });
         } else {
-          const nah = t.liste.length ? "\n\nAm naechsten dran:\n" + t.liste.map((x) => "  " + x.name).join("\n") : "";
+          const nah = t.liste.length ? "\n\nAm nächsten dran:\n" + t.liste.map((x) => "  " + x.name).join("\n") : "";
           await send(`Kein Projekt und kein eigenes Repo passt auf "${erst}".${nah}\n\n/projekte zeigt die registrierten, /projekte repos liest die Repo-Liste neu ein.`);
         }
         continue;
       }
 
       await einreihen(text, null, cur
-        ? `Auftrag laeuft in "${cur.titel}" [${kurz(cur.cwd)}, ${modusName(cur.modus)}]. ${DAUER}`
-        : `Neue Session in ${kurz(reg.naechstesCwd)} wird eroeffnet (Modus ${modusName(reg.naechsterModus)}), Auftrag laeuft. ${DAUER}`);
+        ? `Auftrag läuft in "${cur.titel}" [${kurz(cur.cwd)}, ${modusName(cur.modus)}]. ${DAUER}`
+        : `Neue Session in ${kurz(reg.naechstesCwd)} wird eröffnet (Modus ${modusName(reg.naechsterModus)}), Auftrag läuft. ${DAUER}`);
     }
   } catch (e) { fehler("Loop:", (e && e.message) || e); await new Promise((r) => setTimeout(r, 5000)); }
 }

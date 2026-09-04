@@ -224,6 +224,42 @@ ist widerlegt. Am 2026-09-05 auf LXC 112 an einer **echten vollen Session** geme
 Weil die Rückgabe leer ist, misst `/compact` das Ergebnis selbst: `compact_boundary` im Transkript
 vorher gegen nachher. Ohne diese Gegenprobe würde der Befehl „(leere Antwort)" melden.
 
+## v8.1 (2026-09-05) — drei Mängel aus dem ersten Live-Test
+
+Gefunden von Lars beim ersten echten Lauf am Handy. Alle drei betreffen nicht die Mechanik,
+sondern das, was man tatsächlich sieht — und genau deshalb fallen sie nur im Live-Test auf.
+
+**Markdown kam roh im Chat an.** Claude antwortet in Markdown, der Bot schickte ohne `parse_mode` —
+also standen `**Sternchen**`, `## Rauten` und Backticks als Zeichen da. Jetzt wird nach
+**Telegram-HTML** übersetzt (`<b>`, `<i>`, `<code>`, `<pre>`, `<a>`; Überschriften werden fett,
+Listenpunkte zu `•`). HTML statt MarkdownV2, weil MarkdownV2 ein Dutzend Zeichen zu escapen verlangt
+und bei einem einzigen unbalancierten Zeichen die **ganze** Nachricht ablehnt.
+
+Zwei Sicherungen, weil eine abgelehnte Nachricht schlimmer ist als eine unformatierte: vor dem
+Senden wird geprüft, ob alle Tags im Stück ausgewogen sind, und wird das Stück trotzdem abgelehnt,
+geht es unformatiert raus. Geteilt wird an Zeilengrenzen statt hart nach 3800 Zeichen.
+
+> **Fast selbst gebaut:** die erste Fassung parkte Codeblöcke unter dem Platzhalter `␣N␣`
+> (Leerzeichen-Ziffer-Leerzeichen). Beim Zurücksetzen hätte das auch normalen Text wie
+> „lief 5 Minuten" getroffen und durch einen fremden Codeblock ersetzt. Jetzt klammern NUL-Zeichen.
+> Der Test dazu steht als eigener Fall im Selbsttest.
+
+**Die eigenen Meldungen hatten keine Umlaute** — „eroeffnet", „laeuft", „groessere Auftraege". Das
+stammt aus dem Upstream und war nie nötig: Claudes Antworten zeigten schon immer korrekte Umlaute,
+UTF-8 trägt also über die ganze Strecke. Ersetzt wurde **nur innerhalb von Strings und Kommentaren**
+(Bezeichner wie `naechstesCwd` bleiben unberührt), abgesichert durch einen Vergleich, der beweist,
+dass außerhalb dieser Bereiche kein Zeichen abweicht.
+
+**Kein Befehlsmenü im Chat.** Telegram zeigt den Menüknopf erst, wenn ein Bot seine Befehle über
+`setMyCommands` anmeldet. Passiert jetzt beim Start, mit allen zwölf Befehlen und je einer Zeile
+Erklärung.
+
+**Dazu, aus demselben Testlauf:** `/neu proteinhit` gefolgt von der reinen Frage „was sind die
+nächsten Schritte?" hinterließ einen **leeren Branch** `claude/was-sind-die-nachsten-schritte-i-…`.
+Gibt es am Ende weder Commit noch geänderte Datei, wird jetzt auf den Basis-Branch zurückgewechselt
+und der leere Branch gelöscht. Nebeneffekt: der Branch heißt danach nach dem Auftrag, der wirklich
+etwas geschrieben hat, statt nach einer Zwischenfrage.
+
 ## Was v8 nicht kann (bewusst)
 
 - **Bauteil 3 und 4** (Fortschritt aus dem Transkript, Nebenläufigkeit pro Projekt) — Stufe 3.

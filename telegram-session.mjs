@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Session-Bot v7 (LXC 112) — steuert Claude-Code-Sessions per Telegram.
+// Session-Bot v8 (LXC 112) — steuert Claude-Code-Sessions per Telegram.
 // Abgeleitet von AlphaGenX/claude-telegram-session-bot v6.1 (MIT), mit sechs Korrekturen:
 //   1. MODI.standard: "default" existiert nicht mehr -> "manual"
 //   2. CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT statt MCP_TOOL_TIMEOUT (der echte Killer)
@@ -7,10 +7,18 @@
 //   4. BOT_TOKEN/CHAT_ID werden aus der Claude-Subprozess-Env gestrippt
 //   5. Permission-Relay ueber Dateien statt direktem Telegram-Call im MCP (Token bleibt hier)
 //   6. Pfade auf User claude statt root
-// Befehle: /neu [projekt|/pfad] [Auftrag], /projekte [add name /pfad], /modus, /modell,
-//          /sessions, /wechsel N, /status, /clear, /ende
+// v8 (2026-09-05) — Ausbaustufen 1 und 2 aus dem Grill vom 2026-09-04:
+//   B1 /neu <repo> klont, registriert und startet in einem Zug; unscharfe Namenssuche
+//   B2 Branch + PR als Default fuer jedes Projekt, /direkt als Ausnahme pro Session
+//   B5 Warteschlange persistent, beim Start Rueckfrage mit Ein-Klick-Wiederaufnahme
+//   B6 Timeout 30 Min -> 2 h, Abbruch wird als Zwischenstand gemeldet
+//   B7 Capability-Ping an healthchecks.io (nur bei is_error: false)
+//   dazu /compact (verifiziert: komprimiert per --resume wirklich)
+// Befehle: /neu [repo|projekt|/pfad] [Auftrag], /projekte [add|scan], /direkt, /compact,
+//          /modus, /modell, /sessions, /wechsel N, /status, /clear, /ende
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 
 const TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = Number(process.env.CHAT_ID);
@@ -20,17 +28,27 @@ const API = `https://api.telegram.org/bot${TOKEN}`;
 const HOME = "/home/claude";
 const REG = `${HOME}/.claude-sessions.json`;
 const PROJ = `${HOME}/.config/claude-projekte.json`;
+const REPOS = `${HOME}/.config/claude-repos.json`;
 const PERM_DIR = `${HOME}/.perm`;
 const DEFAULT_CWD = `${HOME}/work`;
 const DEFAULT_MODE = "bypassPermissions"; // Lars-Entscheidung 2026-09-04, Blast-Radius akzeptiert
 const WORK_ROOT = `${HOME}/work`;         // hier entstehen Projekte; /projekte findet sie selbst
 const CLAUDE = "/usr/bin/claude";
 const HOST = "192.168.1.139";
+const GH_USER = "lars-hh";
+// B6: 30 Min reichen fuer ein echtes Refactoring nicht. Ein Abbruch ist ein Zwischenstand,
+// kein Totalverlust — der Branch bleibt, der PR wird trotzdem geoeffnet.
+const RUN_TIMEOUT = 7200000;              // 2 h
+const REPO_CACHE_TTL = 6 * 3600 * 1000;   // 6 h
+// B7: Capability-Ping. Leer = unscharf; das wird laut protokolliert, nicht still verschluckt
+// (Muster aus dem Dead-Man-Switch-Runbook des Proxmox-Hosts).
+const HC_URL = (process.env.HC_URL || "").trim();
+const HC_INTERVAL = 30 * 60 * 1000;
 
 // Korrektur 4: Token und Chat-ID NICHT an den Claude-Subprozess weiterreichen.
 // Sonst kann ein per Prompt Injection gekaperter Agent den Bot-Token lesen und an
 // beliebige chat_id senden — mit Firewall-Regeln nicht zu verhindern.
-const { BOT_TOKEN: _t, CHAT_ID: _c, ...SAFE_ENV } = process.env;
+const { BOT_TOKEN: _t, CHAT_ID: _c, HC_URL: _h, ...SAFE_ENV } = process.env;
 const ENV = {
   ...SAFE_ENV,
   HOME,
@@ -49,8 +67,12 @@ const modusName = (wert) => (Object.entries(MODI).find(([, v]) => v === (wert ||
 const MODELLE = { opus: "claude-opus-5", sonnet: "claude-sonnet-5", haiku: "claude-haiku-4-5" };
 const modellName = (wert) => (Object.entries(MODELLE).find(([, v]) => v === wert) || ["standard"])[0];
 
-const load = () => { try { return JSON.parse(readFileSync(REG, "utf8")); } catch { return { sessions: [], aktiv: null, naechstesCwd: null, naechsterModus: null, naechstesModell: null }; } };
+const LEER = { sessions: [], aktiv: null, naechstesCwd: null, naechsterModus: null, naechstesModell: null, naechsterDirekt: false, warteschlange: [], laufend: null };
+const load = () => { try { return { ...LEER, ...JSON.parse(readFileSync(REG, "utf8")) }; } catch { return { ...LEER }; } };
 const save = (r) => writeFileSync(REG, JSON.stringify(r, null, 2), { mode: 0o600 });
+// Immer frisch laden, aendern, schreiben. pump() und die Nachrichtenschleife laufen
+// nebenlaeufig — ein festgehaltenes reg-Objekt wuerde die Warteschlange ueberschreiben.
+const mutate = (fn) => { const r = load(); const res = fn(r); save(r); return res; };
 const loadProj = () => { try { return JSON.parse(readFileSync(PROJ, "utf8")); } catch { return { work: DEFAULT_CWD }; } };
 const saveProj = (p) => writeFileSync(PROJ, JSON.stringify(p, null, 2), { mode: 0o600 });
 const kurz = (cwd) => {
@@ -60,19 +82,59 @@ const kurz = (cwd) => {
 };
 const wann = (t) => new Date(t).toLocaleString("de-DE", { timeZone: "Europe/Berlin", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 const DAUER = "Antwort kommt meist unter einer Minute, groessere Auftraege brauchen laenger.";
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+const fehler = (...a) => console.error(new Date().toISOString(), ...a);
 
 async function tg(method, body) {
   try {
     const r = await fetch(`${API}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     return await r.json();
-  } catch (e) { console.error(new Date().toISOString(), "TG:", (e && e.message) || e); return null; }
+  } catch (e) { fehler("TG:", (e && e.message) || e); return null; }
 }
 
-async function send(text) {
+async function send(text, extra) {
   let s = String(text ?? "").trim() || "(leere Antwort)";
   if (s.length > 15200) s = s.slice(0, 15200) + "\n[gekuerzt]";
-  for (let i = 0; i < s.length; i += 3800) await tg("sendMessage", { chat_id: CHAT_ID, text: s.slice(i, i + 3800) });
+  let letzte = null;
+  for (let i = 0; i < s.length; i += 3800) {
+    const istLetzte = i + 3800 >= s.length;
+    letzte = await tg("sendMessage", { chat_id: CHAT_ID, text: s.slice(i, i + 3800), ...(istLetzte ? extra || {} : {}) });
+  }
+  return letzte;
 }
+
+// ---------------------------------------------------------------------------
+// Kleine Prozess-Helfer
+// ---------------------------------------------------------------------------
+function sh(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, {
+      cwd: opts.cwd, env: ENV,
+      timeout: opts.timeout ?? 120000,
+      maxBuffer: 8 * 1024 * 1024,
+    }, (e, out, err) => resolve({
+      ok: !e,
+      out: String(out || "").trim(),
+      err: String(err || "").trim() || String((e && e.message) || ""),
+    }));
+  });
+}
+const git = (cwd, ...args) => sh("git", ["-C", cwd, ...args]);
+const istGit = (cwd) => { try { return existsSync(`${cwd}/.git`); } catch { return false; } };
+const kurzId = () => randomBytes(3).toString("hex");
+
+// ---------------------------------------------------------------------------
+// Wartende Entscheidungen (Buttons). Ein Mechanismus fuer drei Faelle:
+// mehrdeutiger Repo-Name, schmutziger Klon, verlorene Warteschlange.
+// ---------------------------------------------------------------------------
+const wartend = new Map(); // id -> { typ, ...daten, ts }
+function frage(daten) {
+  const id = kurzId();
+  wartend.set(id, { ...daten, ts: Date.now() });
+  for (const [k, v] of wartend) if (Date.now() - v.ts > 24 * 3600 * 1000) wartend.delete(k);
+  return id;
+}
+const knopf = (text, id, wahl) => ({ text, callback_data: `act:${id}:${wahl}` });
 
 // ---------------------------------------------------------------------------
 // Korrektur 5: Permission-Relay. Der MCP legt <id>.req ab und kennt keinen Token.
@@ -108,10 +170,193 @@ async function permWatch() {
       const mid = r?.result?.message_id;
       permMsg.set(id, mid ?? null);
     }
-  } catch (e) { console.error(new Date().toISOString(), "PermWatch:", (e && e.message) || e); }
+  } catch (e) { fehler("PermWatch:", (e && e.message) || e); }
 }
 setInterval(permWatch, 1000);
 
+// ---------------------------------------------------------------------------
+// B1: Repo-Katalog und unscharfe Namenssuche
+// ---------------------------------------------------------------------------
+const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+function lev(a, b) {
+  if (a === b) return 0;
+  if (!a.length || !b.length) return Math.max(a.length, b.length);
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// 100 = exakt, >=75 = sicherer Treffer, >=50 = Vorschlag, 0 = kein Treffer.
+function punkte(anfrage, name) {
+  const q = norm(anfrage), n = norm(name);
+  if (!q || !n) return 0;
+  if (q === n) return 100;
+  if (n.startsWith(q)) return Math.max(78, 92 - (n.length - q.length));
+  if (n.includes(q)) return q.length >= 4 ? 76 : 62;
+  if (q.includes(n)) return 70;
+  const d = lev(q, n);
+  const grenze = Math.max(2, Math.floor(Math.max(q.length, n.length) * 0.34));
+  if (d <= grenze) return Math.max(45, 68 - d * 6);
+  return 0;
+}
+
+async function repoKatalog(erzwingen = false) {
+  let cache = null;
+  try { cache = JSON.parse(readFileSync(REPOS, "utf8")); } catch {}
+  if (!erzwingen && cache?.repos?.length && Date.now() - (cache.stand || 0) < REPO_CACHE_TTL) return cache.repos;
+  const r = await sh("gh", ["repo", "list", GH_USER, "--limit", "300", "--json", "name,description,isArchived"], { cwd: HOME, timeout: 60000 });
+  if (!r.ok) {
+    fehler("gh repo list:", r.err.slice(0, 200));
+    return cache?.repos || [];  // lieber ein alter Katalog als gar keiner
+  }
+  let repos = [];
+  try { repos = JSON.parse(r.out).filter((x) => !x.isArchived); } catch { return cache?.repos || []; }
+  try { writeFileSync(REPOS, JSON.stringify({ stand: Date.now(), repos }, null, 2), { mode: 0o600 }); } catch {}
+  return repos;
+}
+
+// Sucht ueber registrierte Projekte UND eigene GitHub-Repos.
+// Ergebnis: { art: "treffer"|"mehrdeutig"|"nichts", ... }
+async function zielFinden(anfrage) {
+  const projekte = loadProj();
+  const kandidaten = new Map(); // schluessel -> { name, punkte, quelle, pfad? }
+  const merke = (name, p, quelle, pfad) => {
+    const alt = kandidaten.get(norm(name));
+    if (!alt || alt.punkte < p) kandidaten.set(norm(name), { name, punkte: p, quelle, pfad });
+  };
+  for (const [name, pfad] of Object.entries(projekte)) {
+    const p = punkte(anfrage, name);
+    if (p) merke(name, Math.min(100, p + 4), "projekt", pfad); // registriert schlaegt ungeklont
+  }
+  for (const repo of await repoKatalog()) {
+    const p = punkte(anfrage, repo.name);
+    if (p) merke(repo.name, p, "repo");
+  }
+  const liste = [...kandidaten.values()].sort((a, b) => b.punkte - a.punkte);
+  if (!liste.length) return { art: "nichts", liste: [] };
+  const [erst, zweit] = liste;
+  if (erst.punkte >= 100 || (erst.punkte >= 75 && (!zweit || erst.punkte - zweit.punkte >= 12))) {
+    return { art: "treffer", ziel: erst, liste };
+  }
+  const nah = liste.filter((x) => x.punkte >= 50).slice(0, 5);
+  if (nah.length) return { art: "mehrdeutig", liste: nah };
+  return { art: "nichts", liste: liste.slice(0, 5) };
+}
+
+// Klont bei Bedarf und liefert den Pfad. Registriert das Projekt gleich mit.
+async function zielBereitstellen(ziel) {
+  const name = ziel.name.toLowerCase();
+  let pfad = ziel.pfad || `${WORK_ROOT}/${ziel.name}`;
+  if (!existsSync(pfad) && existsSync(`${WORK_ROOT}/${name}`)) pfad = `${WORK_ROOT}/${name}`;
+  if (!existsSync(pfad)) {
+    await send(`Klone ${GH_USER}/${ziel.name} nach ${pfad} ...`);
+    const r = await sh("gh", ["repo", "clone", `${GH_USER}/${ziel.name}`, pfad], { cwd: HOME, timeout: 600000 });
+    if (!r.ok || !existsSync(pfad)) return { ok: false, meldung: `Klonen von ${GH_USER}/${ziel.name} fehlgeschlagen:\n${(r.err || "unbekannter Fehler").slice(0, 500)}` };
+  }
+  const p = loadProj();
+  if (p[name] !== pfad) { p[name] = pfad; saveProj(p); }
+  return { ok: true, pfad, name };
+}
+
+// Prueft den vorhandenen Klon. Meldet handlungsfaehig statt nur zu berichten.
+async function klonPruefen(pfad) {
+  if (!istGit(pfad)) return { art: "ok", hinweis: "" };
+  const st = await git(pfad, "status", "--porcelain");
+  const schmutzig = st.out ? st.out.split("\n").filter(Boolean) : [];
+  if (schmutzig.length) {
+    return { art: "schmutzig", dateien: schmutzig };
+  }
+  const upstream = await git(pfad, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}");
+  if (!upstream.ok) return { art: "ok", hinweis: "" };   // rein lokaler Branch, nichts zu ziehen
+  await git(pfad, "fetch", "--quiet", "--all");
+  const pull = await git(pfad, "pull", "--ff-only");
+  if (!pull.ok) return { art: "ok", hinweis: `Hinweis: git pull --ff-only ging nicht durch (${(pull.err || "").split("\n")[0].slice(0, 160)}). Der Klon bleibt auf dem lokalen Stand.` };
+  return { art: "ok", hinweis: "" };
+}
+
+// ---------------------------------------------------------------------------
+// B2: Branch + PR als Default. /direkt ist die Ausnahme pro Session.
+// ---------------------------------------------------------------------------
+const slug = (s) => String(s || "").toLowerCase()
+  .replace(/[äàáâ]/g, "a").replace(/[öòóô]/g, "o").replace(/[üùúû]/g, "u").replace(/ß/g, "ss")
+  .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32).replace(/-+$/, "") || "auftrag";
+
+const stempel = () => {
+  const d = new Date();
+  const z = (n) => String(n).padStart(2, "0");
+  return `${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`;
+};
+
+const branchHinweis = (bi) => `[Bot-Hinweis] Du arbeitest im Git-Branch "${bi.branch}" (Basis "${bi.base}"). `
+  + `Committe alle Aenderungen in diesem Branch mit aussagekraeftigen Nachrichten. Wechsle den Branch nicht, `
+  + `mache kein git push und erstelle keinen Pull Request — das uebernimmt der Bot nach deinem Lauf.\n\nAuftrag:\n`;
+
+// Legt den Branch an bzw. stellt sicher, dass wir noch auf dem der Session sind.
+async function branchVorbereiten(cwd, vorhanden, auftrag) {
+  if (!istGit(cwd)) return { branch: null, meldung: "" };
+  if (vorhanden?.branch) {
+    const jetzt = (await git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).out;
+    if (jetzt === vorhanden.branch) return { branch: vorhanden.branch, base: vorhanden.base, meldung: "" };
+    const co = await git(cwd, "checkout", vorhanden.branch);
+    if (co.ok) return { branch: vorhanden.branch, base: vorhanden.base, meldung: "" };
+    return { branch: null, meldung: `Konnte nicht auf Branch ${vorhanden.branch} zurueck (${(co.err || "").split("\n")[0].slice(0, 140)}). Der Auftrag laeuft auf ${jetzt}.` };
+  }
+  const base = (await git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).out || "main";
+  const branch = `claude/${slug(auftrag)}-${stempel()}`;
+  const co = await git(cwd, "checkout", "-b", branch);
+  if (!co.ok) return { branch: null, meldung: `Branch ${branch} konnte nicht angelegt werden (${(co.err || "").split("\n")[0].slice(0, 140)}). Der Auftrag laeuft direkt auf ${base}.` };
+  return { branch, base, meldung: "" };
+}
+
+// In einem Fork zielt "gh pr create" ohne --repo auf das UPSTREAM-Repo und scheitert
+// mit "No commits between ...". Am 2026-09-05 im Selbsttest an diesem Repo reproduziert.
+// Deshalb wird das Ziel-Repo immer aus der origin-URL abgeleitet und explizit gesetzt.
+function repoAusRemote(url) {
+  const m = String(url || "").match(/github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?$/);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
+// Nach dem Lauf: pushen und PR oeffnen, wenn es Commits gibt. Laeuft auch nach
+// einem Abbruch — genau dann ist der PR der Zwischenstand.
+async function prAbschluss(cwd, bi, titel, auftrag) {
+  if (!bi?.branch || !istGit(cwd)) return null;
+  const zaehl = await git(cwd, "rev-list", "--count", `${bi.base}..HEAD`);
+  const anzahl = parseInt(zaehl.out, 10) || 0;
+  if (!anzahl) {
+    const st = await git(cwd, "status", "--porcelain");
+    const n = st.out ? st.out.split("\n").filter(Boolean).length : 0;
+    if (n) return { text: `Kein Commit im Branch ${bi.branch}, aber ${n === 1 ? "eine geaenderte Datei liegt" : `${n} geaenderte Dateien liegen`} dort. Mit einem neuen Auftrag in derselben Session fortsetzen.` };
+    return null;
+  }
+  const commits = anzahl === 1 ? "1 Commit" : `${anzahl} Commits`;
+  const remote = await git(cwd, "remote", "get-url", "origin");
+  if (!remote.ok) return { text: `${commits} im Branch ${bi.branch} — kein origin-Remote, die Arbeit bleibt lokal auf dem Server.` };
+  const push = await git(cwd, "push", "-u", "origin", bi.branch);
+  if (!push.ok) return { text: `${commits} im Branch ${bi.branch}, aber der Push scheiterte:\n${(push.err || "").slice(-400)}` };
+  if (bi.prUrl) return { text: `${commits} gepusht. PR aktualisiert: ${bi.prUrl}`, prUrl: bi.prUrl };
+  const ziel = repoAusRemote(remote.out);
+  const repoArg = ziel ? ["--repo", ziel] : [];
+  const koerper = `Erstellt vom Session-Bot auf LXC 112.\n\nAuftrag:\n${String(auftrag).slice(0, 2000)}`;
+  const pr = await sh("gh", ["pr", "create", ...repoArg, "--head", bi.branch, "--base", bi.base, "--title", String(titel).slice(0, 70), "--body", koerper], { cwd, timeout: 120000 });
+  if (!pr.ok) {
+    const vorhanden = await sh("gh", ["pr", "view", bi.branch, ...repoArg, "--json", "url", "-q", ".url"], { cwd, timeout: 60000 });
+    if (vorhanden.ok && vorhanden.out.startsWith("http")) return { text: `${commits} gepusht. PR: ${vorhanden.out}`, prUrl: vorhanden.out };
+    return { text: `${commits} nach ${bi.branch} gepusht, aber gh pr create scheiterte:\n${(pr.err || "").slice(-400)}` };
+  }
+  const url = (pr.out.match(/https:\/\/\S+/) || [pr.out])[0];
+  return { text: `${commits} gepusht.\nPull Request: ${url}`, prUrl: url };
+}
+
+// ---------------------------------------------------------------------------
+// Claude ausfuehren
+// ---------------------------------------------------------------------------
 function runClaude(auftrag, resumeId, cwd, modus, modell) {
   return new Promise((resolve) => {
     const args = ["-p", auftrag, "--output-format", "json", "--permission-mode", modus || DEFAULT_MODE,
@@ -120,7 +365,12 @@ function runClaude(auftrag, resumeId, cwd, modus, modell) {
       "--mcp-config", `${HOME}/bin/perm-mcp.json`];
     if (modell) args.push("--model", modell);
     if (resumeId) args.push("--resume", resumeId);
-    const kind = execFile(CLAUDE, args, { cwd: cwd || DEFAULT_CWD, env: ENV, timeout: 1800000, maxBuffer: 16 * 1024 * 1024 }, (e, out) => {
+    const kind = execFile(CLAUDE, args, { cwd: cwd || DEFAULT_CWD, env: ENV, timeout: RUN_TIMEOUT, maxBuffer: 16 * 1024 * 1024 }, (e, out) => {
+      // B6: Abbruch zuerst erkennen — sonst landet die Teilausgabe im JSON-Parser
+      // und der Nutzer liest "Antwort nicht lesbar" statt "abgebrochen".
+      if (e && (e.killed || e.signal)) {
+        return resolve({ ok: false, abbruch: true, error: `Auftrag nach ${Math.round(RUN_TIMEOUT / 60000)} Minuten abgebrochen.` });
+      }
       if (e && !out) return resolve({ ok: false, error: String((e && e.message) || e).slice(-400) });
       let j;
       try { j = JSON.parse(out); }
@@ -130,7 +380,7 @@ function runClaude(auftrag, resumeId, cwd, modus, modell) {
       // als vermeintliche Claude-Antwort im Chat und der Bot wirkt monatelang gesund.
       if (j.is_error === true) {
         const grund = j.result || j.api_error_status || j.terminal_reason || "unbekannter API-Fehler";
-        return resolve({ ok: false, error: `Claude meldet einen Fehler: ${String(grund).slice(0, 400)}` });
+        return resolve({ ok: false, error: `Claude meldet einen Fehler: ${String(grund).slice(0, 400)}`, sid: j.session_id || resumeId || null });
       }
       resolve({ ok: true, result: j.result || "(kein Ergebnis)", sid: j.session_id || resumeId || null });
     });
@@ -138,39 +388,215 @@ function runClaude(auftrag, resumeId, cwd, modus, modell) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// B5: persistente Warteschlange
+// ---------------------------------------------------------------------------
 const queue = [];
 let busy = false;
+
+function qPush(item) {
+  queue.push(item);
+  mutate((r) => { r.warteschlange = [...(r.warteschlange || []), item]; });
+  return queue.length;
+}
+function qShift() {
+  const item = queue.shift();
+  mutate((r) => { r.warteschlange = (r.warteschlange || []).filter((x) => x.qid !== item.qid); r.laufend = item; });
+  return item;
+}
+const qFertig = () => mutate((r) => { r.laufend = null; });
+
 async function pump() {
   if (busy) return;
   busy = true;
-  while (queue.length) {
-    const item = queue.shift();
-    const reg = load();
-    const cur = reg.sessions.find((s) => s.id === reg.aktiv) || null;
-    const cwd = cur ? (cur.cwd || DEFAULT_CWD) : (item.cwd || reg.naechstesCwd || DEFAULT_CWD);
-    const modus = cur ? (cur.modus || DEFAULT_MODE) : (reg.naechsterModus || DEFAULT_MODE);
-    const modell = cur ? (cur.modell || null) : (reg.naechstesModell || null);
-    const r = await runClaude(item.text, cur ? cur.id : null, cwd, modus, modell);
-    if (!r.ok) { await send("Fehlgeschlagen: " + r.error); continue; }
-    const reg2 = load();
-    if (cur) {
-      const s = reg2.sessions.find((x) => x.id === cur.id);
-      if (s) { s.id = r.sid || s.id; s.zuletzt = Date.now(); }
-      if (reg2.aktiv === cur.id) reg2.aktiv = r.sid || cur.id;
-    } else if (r.sid && !reg2.sessions.some((x) => x.id === r.sid)) {
-      reg2.sessions.push({ id: r.sid, titel: item.text.slice(0, 48), cwd, modus, modell, erstellt: Date.now(), zuletzt: Date.now() });
-      if (reg2.sessions.length > 15) reg2.sessions = reg2.sessions.slice(-15);
-      if (!reg2.aktiv) reg2.aktiv = r.sid;
-      reg2.naechstesCwd = null; reg2.naechsterModus = null; reg2.naechstesModell = null;
+  try {
+    while (queue.length) {
+      const item = qShift();
+      try { await auftragAusfuehren(item); }
+      catch (e) { fehler("Auftrag:", (e && e.stack) || e); await send("Interner Fehler beim Auftrag: " + String((e && e.message) || e).slice(0, 300)); }
+      qFertig();
     }
-    save(reg2);
-    await send(r.result);
-  }
-  busy = false;
+  } finally { busy = false; qFertig(); }
 }
 
+async function auftragAusfuehren(item) {
+  const reg = load();
+  const cur = reg.sessions.find((s) => s.id === reg.aktiv) || null;
+  const cwd = cur ? (cur.cwd || DEFAULT_CWD) : (item.cwd || reg.naechstesCwd || DEFAULT_CWD);
+  const modus = cur ? (cur.modus || DEFAULT_MODE) : (reg.naechsterModus || DEFAULT_MODE);
+  const modell = cur ? (cur.modell || null) : (reg.naechstesModell || null);
+  const direkt = cur ? !!cur.direkt : !!reg.naechsterDirekt;
+
+  // B2: Branch anlegen, bevor Claude laeuft — dann kann main auch dann nicht
+  // getroffen werden, wenn Claude den Hinweis im Prompt ignoriert.
+  let bi = { branch: null, base: null, prUrl: cur?.prUrl || null };
+  if (!direkt) {
+    const vor = await branchVorbereiten(cwd, cur, item.text);
+    if (vor.meldung) await send(vor.meldung);
+    bi = { branch: vor.branch, base: vor.base || cur?.base || null, prUrl: cur?.prUrl || null };
+  }
+
+  const prompt = bi.branch ? branchHinweis(bi) + item.text : item.text;
+  const r = await runClaude(prompt, cur ? cur.id : null, cwd, modus, modell);
+
+  // Session festhalten — auch wenn der Lauf schiefging, solange eine ID bekannt ist.
+  const sid = r.sid || (cur ? cur.id : null);
+  mutate((reg2) => {
+    if (cur) {
+      const s = reg2.sessions.find((x) => x.id === cur.id);
+      if (s) {
+        s.id = sid || s.id; s.zuletzt = Date.now();
+        if (bi.branch) { s.branch = bi.branch; s.base = bi.base; }
+      }
+      if (reg2.aktiv === cur.id) reg2.aktiv = sid || cur.id;
+    } else if (sid && !reg2.sessions.some((x) => x.id === sid)) {
+      reg2.sessions.push({ id: sid, titel: item.text.slice(0, 48), cwd, modus, modell, direkt, base: bi.base, branch: bi.branch, prUrl: null, erstellt: Date.now(), zuletzt: Date.now() });
+      if (reg2.sessions.length > 15) reg2.sessions = reg2.sessions.slice(-15);
+      if (!reg2.aktiv) reg2.aktiv = sid;
+      reg2.naechstesCwd = null; reg2.naechsterModus = null; reg2.naechstesModell = null; reg2.naechsterDirekt = false;
+    }
+  });
+
+  if (r.ok) await send(r.result);
+  else if (r.abbruch) await send(`${r.error}\nDas ist ein Zwischenstand, kein Totalverlust: die Arbeit liegt in ${cwd}${bi.branch ? ` im Branch ${bi.branch}` : ""}. Mit einem neuen Auftrag im selben Projekt geht es weiter.`);
+  else await send("Fehlgeschlagen: " + r.error);
+
+  // B6: der PR-Abschluss laeuft auch nach Abbruch und Fehler — genau dann ist er wertvoll.
+  try {
+    const pr = await prAbschluss(cwd, bi, item.text, item.text);
+    if (pr) {
+      await send(pr.text);
+      if (pr.prUrl) mutate((reg3) => { const s = reg3.sessions.find((x) => x.id === (sid || reg3.aktiv)); if (s) s.prUrl = pr.prUrl; });
+    }
+  } catch (e) { fehler("PR:", (e && e.message) || e); }
+}
+
+// ---------------------------------------------------------------------------
+// B7: Capability-Ping. Die Faehigkeit pingen, nicht die Existenz — der Dienst
+// lief am 2026-09-04 monatelang, waehrend nur der Login tot war.
+// ---------------------------------------------------------------------------
+const hc = { letzterOk: null, letzterVersuch: null, letzterFehler: null, unscharfGemeldet: false };
+
+async function hcPing(pfad) {
+  if (!HC_URL) return;
+  try { await fetch(HC_URL + (pfad || ""), { method: "GET", signal: AbortSignal.timeout(15000) }); }
+  catch (e) { fehler("HC-Ping:", (e && e.message) || e); }
+}
+
+async function capabilityPing() {
+  hc.letzterVersuch = Date.now();
+  if (!HC_URL && !hc.unscharfGemeldet) {
+    fehler("Capability-Ping UNSCHARF: HC_URL ist nicht gesetzt. Ein Ausfall des Bots wird nicht extern gemeldet.");
+    hc.unscharfGemeldet = true;
+  }
+  const r = await new Promise((resolve) => {
+    execFile(CLAUDE, ["-p", "Antworte nur mit OK.", "--output-format", "json", "--model", MODELLE.haiku, "--permission-mode", "plan"],
+      { cwd: DEFAULT_CWD, env: ENV, timeout: 180000, maxBuffer: 4 * 1024 * 1024 }, (e, out) => {
+        if (e && !out) return resolve({ ok: false, grund: String((e && e.message) || e).slice(0, 200) });
+        try {
+          const j = JSON.parse(out);
+          if (j.is_error === true) return resolve({ ok: false, grund: String(j.result || j.terminal_reason || "is_error").slice(0, 200) });
+          return resolve({ ok: true });
+        } catch { return resolve({ ok: false, grund: "Antwort nicht lesbar" }); }
+      });
+  });
+  if (r.ok) { hc.letzterOk = Date.now(); hc.letzterFehler = null; await hcPing(""); log("Capability-Ping: ok"); }
+  else { hc.letzterFehler = r.grund; await hcPing("/fail"); fehler("Capability-Ping FEHLGESCHLAGEN:", r.grund); }
+}
+setTimeout(capabilityPing, 20000);
+setInterval(capabilityPing, HC_INTERVAL);
+
+// ---------------------------------------------------------------------------
+// /compact — verifiziert am 2026-09-05: komprimiert per --resume wirklich.
+// num_turns: 0 und leeres result sind die normale Signatur eines Slash-Commands
+// im -p-Modus, kein Nichtstun. Beleg ist der compact_boundary im Transkript.
+// ---------------------------------------------------------------------------
+const transkriptPfad = (cwd, sid) => `${HOME}/.claude/projects/${String(cwd).replace(/[^a-zA-Z0-9]/g, "-")}/${sid}.jsonl`;
+function grenzen(pfad) {
+  try { return (readFileSync(pfad, "utf8").match(/compact_boundary/g) || []).length; } catch { return -1; }
+}
+
+// ---------------------------------------------------------------------------
+// Auftrag einreihen (gemeinsamer Weg fuer /neu und freie Nachrichten)
+// ---------------------------------------------------------------------------
+async function einreihen(text, cwd, meldungWennFrei) {
+  const pos = qPush({ qid: kurzId(), text, cwd: cwd || null, ts: Date.now() });
+  await send(busy ? `Eingereiht, Position ${pos}.` : meldungWennFrei);
+  pump();
+}
+
+async function neuStarten(pfad, name, auftrag, hinweis) {
+  mutate((r) => { r.aktiv = null; r.naechstesCwd = pfad; });
+  const reg = load();
+  const wie = reg.naechsterDirekt ? "direkt auf dem Hauptbranch" : "auf einem eigenen Branch mit PR";
+  const kopf = (hinweis ? hinweis + "\n" : "") + `Neue Session in ${name} (${pfad}), ${wie}.`;
+  if (auftrag) await einreihen(auftrag, pfad, `${kopf} Auftrag laeuft. ${DAUER}`);
+  else await send(`${kopf}\nDeine naechste Nachricht eroeffnet sie.`);
+}
+
+// Der gemeinsame Weg von "/neu <name>" bis zum laufenden Auftrag.
+async function zielOeffnen(ziel, auftrag, vorHinweis) {
+  const b = await zielBereitstellen(ziel);
+  if (!b.ok) { await send(b.meldung); return; }
+  const pruef = await klonPruefen(b.pfad);
+  if (pruef.art === "schmutzig") {
+    const id = frage({ typ: "dirty", pfad: b.pfad, name: b.name, auftrag: auftrag || "", vorHinweis: vorHinweis || "" });
+    const liste = pruef.dateien.slice(0, 8).map((z) => "  " + z).join("\n");
+    await send(
+      `${b.name} hat ${pruef.dateien.length} ungespeicherte Aenderung(en) im Klon auf dem Server:\n${liste}${pruef.dateien.length > 8 ? "\n  ..." : ""}\n\n`
+      + `Ich habe deshalb nicht gepullt. Wie weiter?`,
+      { reply_markup: { inline_keyboard: [
+        [knopf("Aenderungen behalten und weiter", id, "weiter")],
+        [knopf("Wegstashen und frisch ziehen", id, "stash")],
+        [knopf("Verwerfen und frisch ziehen", id, "reset")],
+        [knopf("Abbrechen", id, "abbruch")],
+      ] } });
+    return;
+  }
+  await neuStarten(b.pfad, b.name, auftrag, [vorHinweis, pruef.hinweis].filter(Boolean).join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Start: verlorene Warteschlange sichtbar machen (B5)
+// ---------------------------------------------------------------------------
+async function verloreneAuftraege() {
+  const r = load();
+  const offen = [...(r.laufend ? [r.laufend] : []), ...(r.warteschlange || [])];
+  if (!offen.length) return;
+  mutate((x) => { x.warteschlange = []; x.laufend = null; });
+  const id = frage({ typ: "queue", items: offen });
+  const liste = offen.map((x, i) => `${i + 1}. ${String(x.text).slice(0, 90)}`).join("\n");
+  await send(
+    `Beim letzten Stopp waren ${offen.length} Auftraege offen — sie wurden nicht ausgefuehrt:\n${liste}\n\n`
+    + `${r.laufend ? "Der erste lief bereits, seine Arbeit kann teilweise auf der Platte liegen.\n" : ""}Was soll damit passieren?`,
+    { reply_markup: { inline_keyboard: [
+      [knopf("Alle erneut einreihen", id, "alle")],
+      [knopf("Verwerfen", id, "weg")],
+    ] } });
+}
+
+// ---------------------------------------------------------------------------
+// Hauptschleife
+// ---------------------------------------------------------------------------
 let offset = 0;
-console.log(new Date().toISOString(), "Session-Bot v7 gestartet (LXC 112, User claude)");
+log(`Session-Bot v8 gestartet (LXC 112, User claude). Capability-Ping: ${HC_URL ? "scharf" : "UNSCHARF (HC_URL fehlt)"}`);
+await verloreneAuftraege();
+
+const HILFE = "Session-Bot bereit (LXC 112). Jede Nachricht ist ein Auftrag an die aktive Claude-Session.\n\n"
+  + "/neu <repo|projekt|/pfad> [Auftrag] - klont bei Bedarf, registriert und startet in einem Zug; der Name darf unscharf sein\n"
+  + "/projekte - Verzeichnisse zeigen, mit add registrieren, mit scan uebernehmen\n"
+  + "/direkt [aus] - fuer diese Session direkt auf dem Hauptbranch statt Branch+PR\n"
+  + "/compact - Kontext der aktiven Session verdichten\n"
+  + "/modus [standard|edits|plan|auto|voll] - Berechtigungsmodus\n"
+  + "/modell [opus|sonnet|haiku|standard] - Sprachmodell\n"
+  + "/sessions - alle Sessions\n"
+  + "/wechsel N - Session wechseln\n"
+  + "/status - Stand plus SSH-Befehl zum Fortsetzen\n"
+  + "/clear - Kontext leeren\n"
+  + "/ende - aktive Session ablegen\n\n"
+  + "Standard ist Branch + Pull Request: der Bot legt vor dem Lauf einen Branch an und oeffnet danach den PR. "
+  + "Web-Suche ist erlaubt. Braucht Claude weitere Rechte, kommt eine Freigabe-Anfrage mit Buttons. " + DAUER;
+
 while (true) {
   try {
     const res = await fetch(`${API}/getUpdates?timeout=50&offset=${offset}`);
@@ -195,7 +621,45 @@ while (true) {
                 await tg("editMessageText", { chat_id: CHAT_ID, message_id: cq.message.message_id,
                   text: ((antwort === "ja" ? "ERLAUBT - Claude fuehrt aus:\n" : "ABGELEHNT - Claude ueberspringt:\n") + orig).slice(0, 4000) });
               }
-            } catch (e) { console.error(new Date().toISOString(), "Perm:", (e && e.message) || e); note = "Fehler"; }
+            } catch (e) { fehler("Perm:", (e && e.message) || e); note = "Fehler"; }
+          }
+        } else if (cq.from.id === CHAT_ID && cq.data && cq.data.startsWith("act:")) {
+          const [, id, wahl] = cq.data.split(":");
+          const akt = wartend.get(id);
+          if (!akt) note = "Die Frage ist nicht mehr aktuell";
+          else {
+            wartend.delete(id);
+            note = "Verstanden";
+            if (cq.message) await tg("editMessageReplyMarkup", { chat_id: CHAT_ID, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } });
+            if (akt.typ === "queue") {
+              if (wahl === "alle") {
+                for (const it of akt.items) qPush({ ...it, qid: kurzId() });
+                await send(`${akt.items.length} Auftraege wieder eingereiht.`);
+                pump();
+              } else await send("Verworfen.");
+            } else if (akt.typ === "wahl") {
+              const ziel = akt.liste[parseInt(wahl, 10)];
+              if (!ziel) await send("Auswahl nicht mehr gueltig.");
+              else await zielOeffnen(ziel, akt.auftrag, `Gewaehlt: ${ziel.name}.`);
+            } else if (akt.typ === "dirty") {
+              if (wahl === "abbruch") { await send("Abgebrochen. Der Klon bleibt unveraendert."); }
+              else {
+                let hinweis = akt.vorHinweis || "";
+                if (wahl === "stash") {
+                  const s = await git(akt.pfad, "stash", "push", "-u", "-m", `bot ${new Date().toISOString()}`);
+                  hinweis += (hinweis ? "\n" : "") + (s.ok ? "Aenderungen gestasht (git stash list zeigt sie)." : `Stash fehlgeschlagen: ${(s.err || "").split("\n")[0].slice(0, 140)}`);
+                  if (s.ok) { const p = await klonPruefen(akt.pfad); if (p.hinweis) hinweis += "\n" + p.hinweis; }
+                } else if (wahl === "reset") {
+                  await git(akt.pfad, "reset", "--hard");
+                  await git(akt.pfad, "clean", "-fd");
+                  hinweis += (hinweis ? "\n" : "") + "Lokale Aenderungen verworfen.";
+                  const p = await klonPruefen(akt.pfad); if (p.hinweis) hinweis += "\n" + p.hinweis;
+                } else {
+                  hinweis += (hinweis ? "\n" : "") + "Die lokalen Aenderungen bleiben stehen, es wurde nicht gepullt.";
+                }
+                await neuStarten(akt.pfad, akt.name, akt.auftrag, hinweis);
+              }
+            }
           }
         }
         await tg("answerCallbackQuery", { callback_query_id: cq.id, text: note });
@@ -208,10 +672,39 @@ while (true) {
       const reg = load();
       const cur = reg.sessions.find((s) => s.id === reg.aktiv) || null;
 
-      if (text === "/start") {
-        await send("Session-Bot bereit (LXC 112). Jede Nachricht ist ein Auftrag an die aktive Claude-Session.\n\n/neu [projekt] [Auftrag] - neue Session, Verzeichnis waehlbar\n/projekte - Verzeichnisse zeigen, mit add registrieren\n/modus [standard|edits|plan|auto|voll] - Berechtigungsmodus\n/modell [opus|sonnet|haiku|standard] - Sprachmodell\n/sessions - alle Sessions\n/wechsel N - Session wechseln\n/status - Stand plus SSH-Befehl zum Fortsetzen\n/clear - Kontext leeren\n/ende - aktive Session ablegen\n\nWeb-Suche ist erlaubt. Braucht Claude weitere Rechte, kommt eine Freigabe-Anfrage mit Buttons. " + DAUER);
+      if (text === "/start" || text === "/hilfe") { await send(HILFE); continue; }
+
+      if (text === "/direkt" || text.startsWith("/direkt ")) {
+        const aus = text.slice(7).trim().toLowerCase() === "aus";
+        if (cur) {
+          if (!aus && cur.branch) {
+            await send(`Diese Session arbeitet bereits im Branch ${cur.branch}. /direkt gilt ab der naechsten neuen Session — sonst waere der halbfertige Branch verwaist.`);
+            continue;
+          }
+          mutate((r) => { const s = r.sessions.find((x) => x.id === cur.id); if (s) s.direkt = !aus; });
+          await send(aus ? `"${cur.titel}" arbeitet wieder mit Branch + PR.` : `"${cur.titel}" arbeitet ab jetzt direkt auf dem Hauptbranch. Kein PR, kein Diff zum Gegenlesen.`);
+        } else {
+          mutate((r) => { r.naechsterDirekt = !aus; });
+          await send(aus ? "Naechste Session: Branch + PR (Standard)." : "Naechste Session: direkt auf dem Hauptbranch. Kein PR, kein Diff zum Gegenlesen.");
+        }
         continue;
       }
+
+      if (text === "/compact") {
+        if (!cur) { await send("Keine aktive Session zum Verdichten."); continue; }
+        const pfad = transkriptPfad(cur.cwd || DEFAULT_CWD, cur.id);
+        const vorher = grenzen(pfad);
+        await send("Verdichte den Kontext ...");
+        const r = await runClaude("/compact", cur.id, cur.cwd || DEFAULT_CWD, cur.modus || DEFAULT_MODE, cur.modell || null);
+        if (!r.ok) { await send("Verdichten fehlgeschlagen: " + r.error); continue; }
+        const nachher = grenzen(pfad);
+        mutate((x) => { const s = x.sessions.find((y) => y.id === cur.id); if (s) s.zuletzt = Date.now(); });
+        if (vorher >= 0 && nachher > vorher) await send(`Kontext verdichtet. Die Session laeuft unter derselben ID weiter, das Wissen aus den frueheren Nachrichten bleibt als Zusammenfassung erhalten.`);
+        else if (vorher >= 0 && nachher === vorher) await send("Claude hat den Befehl angenommen, im Transkript ist aber keine neue Verdichtung entstanden — vermutlich war der Kontext dafuer noch zu klein.");
+        else await send("Verdichtung ausgefuehrt. (Transkript nicht auffindbar, deshalb ohne Gegenprobe.)");
+        continue;
+      }
+
       if (text === "/modus" || text.startsWith("/modus ")) {
         const arg = text.slice(6).trim().toLowerCase();
         if (!arg) {
@@ -222,12 +715,10 @@ while (true) {
           const warn = arg === "voll" ? "\nVorsicht: Claude fragt in dieser Session nichts mehr an."
                      : arg === "edits" ? "\nHinweis: genehmigt auch rm/mv/cp/sed im Arbeitsverzeichnis." : "";
           if (cur) {
-            const s = reg.sessions.find((x) => x.id === cur.id);
-            if (s) s.modus = MODI[arg];
-            save(reg);
+            mutate((r) => { const s = r.sessions.find((x) => x.id === cur.id); if (s) s.modus = MODI[arg]; });
             await send(`Modus fuer "${cur.titel}": ${arg}${warn}`);
           } else {
-            reg.naechsterModus = MODI[arg]; save(reg);
+            mutate((r) => { r.naechsterModus = MODI[arg]; });
             await send(`Modus fuer die naechste Session: ${arg}${warn}`);
           }
         }
@@ -242,11 +733,9 @@ while (true) {
         } else {
           const wert = arg === "standard" ? null : MODELLE[arg];
           if (cur) {
-            const s = reg.sessions.find((x) => x.id === cur.id);
-            if (s) s.modell = wert;
-            save(reg);
+            mutate((r) => { const s = r.sessions.find((x) => x.id === cur.id); if (s) s.modell = wert; });
             await send(`Modell fuer "${cur.titel}": ${arg}`);
-          } else { reg.naechstesModell = wert; save(reg); await send(`Modell fuer die naechste Session: ${arg}`); }
+          } else { mutate((r) => { r.naechstesModell = wert; }); await send(`Modell fuer die naechste Session: ${arg}`); }
         }
         continue;
       }
@@ -278,66 +767,101 @@ while (true) {
           for (const pf of neu) p[pf.split("/").pop().toLowerCase()] = pf;
           saveProj(p);
           await send("Neu registriert:\n" + neu.map((pf) => `${pf.split("/").pop().toLowerCase()} -> ${pf}`).join("\n"));
+        } else if (teile[1] === "repos") {
+          const repos = await repoKatalog(true);
+          await send(repos.length ? `${repos.length} eigene Repos neu eingelesen. /neu <name> holt jedes davon selbst.` : "Repo-Liste konnte nicht geladen werden (gh nicht erreichbar?).");
         } else {
           const p = loadProj();
           const neu = unregistriert();
           let t = "Projekte:\n" + Object.entries(p).map(([k, v]) => `${k} -> ${v}`).join("\n");
           if (neu.length) t += `\n\nNoch nicht registriert (in ${WORK_ROOT}):\n` + neu.map((pf) => "  " + pf.split("/").pop()).join("\n") + "\n\nAlle uebernehmen: /projekte scan";
           t += "\n\nEinzeln: /projekte add name [pfad]  (ohne Pfad = " + WORK_ROOT + "/name)";
-          t += "\nNeues Repo holen: schick einfach \"clone lars-hh/<repo> nach ~/work/<repo>\" als Auftrag.";
+          t += "\nNeues Repo holen: /neu <reponame> [Auftrag] — klont selbst, der Name darf unscharf sein.";
+          t += "\nRepo-Liste neu einlesen: /projekte repos";
           await send(t);
         }
         continue;
       }
       if (text === "/sessions") {
         if (!reg.sessions.length) { await send("Keine Sessions. Schick einfach einen Auftrag oder /neu."); continue; }
-        await send(reg.sessions.map((s, i) => `${i + 1}. ${s.titel} [${kurz(s.cwd)}, ${modusName(s.modus)}, ${modellName(s.modell)}] - zuletzt ${wann(s.zuletzt)}${s.id === reg.aktiv ? " (aktiv)" : ""}`).join("\n") + "\nWechseln mit /wechsel N");
+        await send(reg.sessions.map((s, i) => `${i + 1}. ${s.titel} [${kurz(s.cwd)}, ${modusName(s.modus)}, ${modellName(s.modell)}${s.branch ? `, ${s.branch}` : s.direkt ? ", direkt" : ""}] - zuletzt ${wann(s.zuletzt)}${s.id === reg.aktiv ? " (aktiv)" : ""}`).join("\n") + "\nWechseln mit /wechsel N");
         continue;
       }
       if (text.startsWith("/wechsel")) {
         const n = parseInt(text.split(/\s+/)[1], 10);
         const ziel = reg.sessions[n - 1];
         if (!ziel) { await send("Unbekannte Nummer. /sessions zeigt die Liste."); continue; }
-        reg.aktiv = ziel.id; save(reg);
-        await send(`Aktiv: ${ziel.titel} [${kurz(ziel.cwd)}, ${modusName(ziel.modus)}, ${modellName(ziel.modell)}]`);
+        mutate((r) => { r.aktiv = ziel.id; });
+        await send(`Aktiv: ${ziel.titel} [${kurz(ziel.cwd)}, ${modusName(ziel.modus)}, ${modellName(ziel.modell)}]${ziel.branch ? `\nBranch: ${ziel.branch}` : ""}${ziel.prUrl ? `\nPR: ${ziel.prUrl}` : ""}`);
         continue;
       }
       if (text === "/status") {
-        const lage = busy ? `Ein Auftrag laeuft gerade${queue.length ? `, ${queue.length} in Warteschlange` : ""}.` : "Bereit.";
-        if (cur) await send(`Aktive Session: ${cur.titel}\nVerzeichnis: ${cur.cwd || DEFAULT_CWD}\nModus: ${modusName(cur.modus)}\nModell: ${modellName(cur.modell)}\nZuletzt: ${wann(cur.zuletzt)}\n${lage}\n\nAm Rechner fortsetzen:\nssh -i ~/.ssh/claude_proxmox root@${HOST}\nsu - claude\ncd "${cur.cwd || DEFAULT_CWD}" && claude --resume ${cur.id}`);
-        else await send(`Keine aktive Session. ${lage}`);
+        const lage = busy ? `Ein Auftrag laeuft gerade${queue.length ? `, ${queue.length} in Warteschlange` : ""}.` : queue.length ? `${queue.length} in Warteschlange.` : "Bereit.";
+        const wacht = !HC_URL ? "Aussenwache: UNSCHARF (HC_URL nicht gesetzt) — ein Ausfall faellt niemandem auf."
+          : hc.letzterFehler ? `Aussenwache: FEHLER (${hc.letzterFehler.slice(0, 120)}), zuletzt ok ${hc.letzterOk ? wann(hc.letzterOk) : "nie"}`
+          : `Aussenwache: scharf, letzter erfolgreicher Faehigkeits-Test ${hc.letzterOk ? wann(hc.letzterOk) : "steht noch aus"}`;
+        if (cur) await send(`Aktive Session: ${cur.titel}\nVerzeichnis: ${cur.cwd || DEFAULT_CWD}\nModus: ${modusName(cur.modus)}\nModell: ${modellName(cur.modell)}\nArbeitsweise: ${cur.direkt ? "direkt auf dem Hauptbranch" : `Branch + PR${cur.branch ? ` (${cur.branch})` : ""}`}${cur.prUrl ? `\nPR: ${cur.prUrl}` : ""}\nZuletzt: ${wann(cur.zuletzt)}\n${lage}\n${wacht}\n\nAm Rechner fortsetzen:\nssh -i ~/.ssh/claude_proxmox root@${HOST}\nsu - claude\ncd "${cur.cwd || DEFAULT_CWD}" && claude --resume ${cur.id}`);
+        else await send(`Keine aktive Session. ${lage}\n${wacht}`);
         continue;
       }
       if (text === "/clear") {
         if (!cur) { await send("Keine aktive Session. /neu startet frisch."); continue; }
-        reg.sessions = reg.sessions.filter((s) => s.id !== cur.id);
-        reg.aktiv = null; reg.naechstesCwd = cur.cwd || DEFAULT_CWD; reg.naechsterModus = cur.modus || null; reg.naechstesModell = cur.modell || null; save(reg);
-        await send(`Kontext geleert. Deine naechste Nachricht startet frisch in ${kurz(cur.cwd)} (Modus ${modusName(cur.modus)}).`);
+        mutate((r) => {
+          r.sessions = r.sessions.filter((s) => s.id !== cur.id);
+          r.aktiv = null; r.naechstesCwd = cur.cwd || DEFAULT_CWD; r.naechsterModus = cur.modus || null;
+          r.naechstesModell = cur.modell || null; r.naechsterDirekt = !!cur.direkt;
+        });
+        await send(`Kontext geleert. Deine naechste Nachricht startet frisch in ${kurz(cur.cwd)} (Modus ${modusName(cur.modus)}).${cur.branch ? `\nDer Branch ${cur.branch} bleibt stehen; die neue Session legt einen eigenen an.` : ""}`);
         continue;
       }
       if (text === "/ende") {
         if (!cur) { await send("Keine aktive Session."); continue; }
-        reg.sessions = reg.sessions.filter((s) => s.id !== cur.id);
-        reg.aktiv = null; save(reg);
+        mutate((r) => { r.sessions = r.sessions.filter((s) => s.id !== cur.id); r.aktiv = null; });
         await send(`Abgelegt: ${cur.titel}. Das Transkript bleibt auf dem Server erhalten.`);
         continue;
       }
+
+      // B1: /neu macht alles selbst — klonen, registrieren, starten. Nie einen Pfad tippen.
       if (text === "/neu" || text.startsWith("/neu ")) {
         const rest = text.slice(4).trim();
+        if (!rest) {
+          mutate((r) => { r.aktiv = null; r.naechstesCwd = null; });
+          await send(`Alles klar, deine naechste Nachricht eroeffnet eine neue Session in ${kurz(null)}.`);
+          continue;
+        }
+        const erst = rest.split(/\s+/)[0];
+        const auftrag = rest.slice(erst.length).trim();
         const projekte = loadProj();
-        let cwd = null, auftrag = rest;
-        const erst = rest.split(/\s+/)[0] || "";
-        if (projekte[erst.toLowerCase()]) { cwd = projekte[erst.toLowerCase()]; auftrag = rest.slice(erst.length).trim(); }
-        else if (erst.startsWith("/") && existsSync(erst)) { cwd = erst; auftrag = rest.slice(erst.length).trim(); }
-        if (cwd && !existsSync(cwd)) { await send(`Verzeichnis ${cwd} existiert nicht mehr. /projekte zeigt die Liste.`); continue; }
-        reg.aktiv = null; reg.naechstesCwd = cwd; save(reg);
-        if (auftrag) { queue.push({ text: auftrag, cwd }); await send(`Neue Session in ${kurz(cwd)} wird eroeffnet, Auftrag laeuft. ${DAUER}`); pump(); }
-        else await send(`Alles klar, deine naechste Nachricht eroeffnet eine neue Session in ${kurz(cwd)} (Modus ${modusName(reg.naechsterModus)}).`);
+
+        if (erst.startsWith("/")) {              // absoluter Pfad
+          if (!existsSync(erst)) { await send(`Verzeichnis ${erst} existiert nicht auf dem Server.`); continue; }
+          await neuStarten(erst, kurz(erst), auftrag, "");
+          continue;
+        }
+        if (projekte[erst.toLowerCase()] && existsSync(projekte[erst.toLowerCase()])) {
+          await zielOeffnen({ name: erst.toLowerCase(), pfad: projekte[erst.toLowerCase()], quelle: "projekt" }, auftrag, "");
+          continue;
+        }
+        await send(`Suche "${erst}" ...`);
+        const t = await zielFinden(erst);
+        if (t.art === "treffer") {
+          const hin = norm(t.ziel.name) === norm(erst) ? "" : `Gemeint ist vermutlich ${t.ziel.name} — ich nehme das.`;
+          await zielOeffnen(t.ziel, auftrag, hin);
+        } else if (t.art === "mehrdeutig") {
+          const id = frage({ typ: "wahl", liste: t.liste, auftrag });
+          await send(t.liste.length === 1 ? `Meintest du ${t.liste[0].name}?` : `"${erst}" passt auf mehrere. Welches?`, {
+            reply_markup: { inline_keyboard: t.liste.map((x, i) => [knopf(`${x.name}${x.quelle === "projekt" ? " (schon da)" : ""}`, id, String(i))]) },
+          });
+        } else {
+          const nah = t.liste.length ? "\n\nAm naechsten dran:\n" + t.liste.map((x) => "  " + x.name).join("\n") : "";
+          await send(`Kein Projekt und kein eigenes Repo passt auf "${erst}".${nah}\n\n/projekte zeigt die registrierten, /projekte repos liest die Repo-Liste neu ein.`);
+        }
         continue;
       }
-      queue.push({ text, cwd: null });
-      await send(busy ? `Eingereiht, Position ${queue.length}.` : cur ? `Auftrag laeuft in "${cur.titel}" [${kurz(cur.cwd)}, ${modusName(cur.modus)}]. ${DAUER}` : `Neue Session in ${kurz(reg.naechstesCwd)} wird eroeffnet (Modus ${modusName(reg.naechsterModus)}), Auftrag laeuft. ${DAUER}`);
-      pump();
+
+      await einreihen(text, null, cur
+        ? `Auftrag laeuft in "${cur.titel}" [${kurz(cur.cwd)}, ${modusName(cur.modus)}]. ${DAUER}`
+        : `Neue Session in ${kurz(reg.naechstesCwd)} wird eroeffnet (Modus ${modusName(reg.naechsterModus)}), Auftrag laeuft. ${DAUER}`);
     }
-  } catch (e) { console.error(new Date().toISOString(), "Loop:", (e && e.message) || e); await new Promise((r) => setTimeout(r, 5000)); }
+  } catch (e) { fehler("Loop:", (e && e.message) || e); await new Promise((r) => setTimeout(r, 5000)); }
 }

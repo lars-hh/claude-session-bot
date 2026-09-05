@@ -260,6 +260,35 @@ Gibt es am Ende weder Commit noch geänderte Datei, wird jetzt auf den Basis-Bra
 und der leere Branch gelöscht. Nebeneffekt: der Branch heißt danach nach dem Auftrag, der wirklich
 etwas geschrieben hat, statt nach einer Zwischenfrage.
 
+## v8.2 (2026-09-05) — `/rc`: der Bot macht eine Remote-Control-Sitzung auf
+
+Der tragende Satz aus dem Grill war: *„wenn kein Cloud offen ist mit einem Remote Control, komme ich
+gar nicht mehr ran."* Diese Lücke ist jetzt geschlossen, ohne dass der Bot ein eigenes Feature
+bekommt — er drückt einen Knopf, den Claude Code schon hat.
+
+```
+/rc [projekt]      Sitzung öffnen (klont bei Bedarf, unscharfer Name erlaubt)
+/rc liste          offene Sitzungen
+/rc stop [projekt] beenden
+```
+
+Zurück kommt eine `claude.ai/code`-Adresse: die **volle** Claude-Code-Oberfläche mit Rückfragen,
+Dateiansicht und Unterbrechen — im Gegensatz zum Ein-Auftrag-Weg des Bots. Damit ist die Kette
+vollständig: Telegram erreicht man immer → Bot öffnet die Sitzung → Link aufs Handy.
+
+Der Befehl ist `claude --remote-control <name>` und ausdrücklich **interaktiv**, braucht also ein
+echtes Terminal. Auf einer Maschine ohne Bildschirm heißt das tmux. Der Start beantwortet die zwei
+Erstdialoge (Ordner-Vertrauen, Renderer) selbst, indem er das tmux-Fenster liest, und wartet auf die
+Adresse. Gemessen: **6 Sekunden** bis zur Adresse, ein zweiter Aufruf liefert dieselbe Sitzung.
+
+> **Dieselbe Falle, zum dritten Mal:** der erste Versuch leitete die Ausgabe durch `tee` in eine
+> Logdatei. Damit ist das TTY weg, Claude fällt auf `--print` zurück und stirbt mit *„Input must be
+> provided…"* — wortwörtlich die Ursache, die den alten `claude-telegram.service` in seine 23.457
+> Neustarts getrieben hat. Wer eine interaktive Sitzung startet, darf ihre Ausgabe nicht umleiten.
+
+Der Aufruf läuft bewusst **ohne `await`** aus der Nachrichtenschleife heraus, damit der Bot während
+des Starts weiter auf Nachrichten hört.
+
 ## Was v8 nicht kann (bewusst)
 
 - **Bauteil 3 und 4** (Fortschritt aus dem Transkript, Nebenläufigkeit pro Projekt) — Stufe 3.

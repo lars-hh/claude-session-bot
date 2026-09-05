@@ -417,6 +417,52 @@ async function prAbschluss(cwd, bi, titel, auftrag) {
 }
 
 // ---------------------------------------------------------------------------
+// Remote Control: eine interaktive Sitzung auf dieser Maschine aufmachen und die
+// claude.ai-Adresse zurückgeben. Damit schließt sich die Lücke aus dem Grill —
+// "wenn kein Cloud offen ist mit Remote Control, komme ich gar nicht mehr ran":
+// Telegram erreicht man immer, und der Bot drückt den Knopf.
+//
+// --remote-control ist ausdrücklich *interaktiv* und braucht ein echtes Terminal,
+// deshalb tmux. Wer die Ausgabe umleitet (Pipe, tee, Logdatei), nimmt Claude das
+// TTY weg, es fällt auf --print zurück und stirbt mit "Input must be provided" —
+// genau die Ursache, die den alten claude-telegram.service in 23.457 Neustarts trieb.
+// ---------------------------------------------------------------------------
+const RC_ADRESSE = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9_-]+/;
+const rcName = (cwd) => "rc-" + slug(String(cwd).split("/").filter(Boolean).pop() || "work");
+const tmux = (...args) => sh("tmux", args, { cwd: HOME, timeout: 30000 });
+const warte = (ms) => new Promise((r) => setTimeout(r, ms));
+const rcLaeuft = async (name) => (await tmux("has-session", "-t", name)).ok;
+const rcFenster = async (name) => { const r = await tmux("capture-pane", "-p", "-t", name); return r.ok ? r.out : ""; };
+const rcTaste = async (name, taste) => { await tmux("send-keys", "-t", name, taste); await warte(400); await tmux("send-keys", "-t", name, "Enter"); };
+
+async function rcStarten(cwd, name) {
+  if (await rcLaeuft(name)) {
+    const adresse = (await rcFenster(name)).match(RC_ADRESSE);
+    if (adresse) return { ok: true, url: adresse[0], schonDa: true };
+    await tmux("kill-session", "-t", name); // leere Hülle, neu aufsetzen
+  }
+  const start = await tmux("new-session", "-d", "-s", name, "-x", "200", "-y", "50",
+    `cd ${JSON.stringify(cwd)} && ${CLAUDE} --remote-control ${name}; echo "[beendet]"; exec bash`);
+  if (!start.ok) return { ok: false, fehler: `tmux konnte die Sitzung nicht starten: ${(start.err || "").slice(0, 300)}` };
+  // Die zwei Startdialoge beantworten und auf die Adresse warten.
+  for (let i = 0; i < 40; i++) {
+    await warte(3000);
+    const fenster = await rcFenster(name);
+    const adresse = fenster.match(RC_ADRESSE);
+    if (adresse) return { ok: true, url: adresse[0] };
+    if (/trust this folder|Is this a project you created/i.test(fenster)) { await rcTaste(name, "Down"); continue; }
+    if (/fullscreen renderer/i.test(fenster)) { await rcTaste(name, "2"); continue; }
+    if (!(await rcLaeuft(name))) return { ok: false, fehler: "Die Sitzung war sofort wieder beendet:\n" + fenster.slice(-500) };
+  }
+  return { ok: false, fehler: "Nach zwei Minuten kam keine Remote-Control-Adresse. Stand im Fenster:\n" + (await rcFenster(name)).slice(-500) };
+}
+
+async function rcListe() {
+  const r = await tmux("list-sessions", "-F", "#{session_name}");
+  return r.ok ? r.out.split("\n").filter((z) => z.startsWith("rc-")) : [];
+}
+
+// ---------------------------------------------------------------------------
 // Claude ausführen
 // ---------------------------------------------------------------------------
 function runClaude(auftrag, resumeId, cwd, modus, modell) {
@@ -589,6 +635,18 @@ async function einreihen(text, cwd, meldungWennFrei) {
   pump();
 }
 
+// Laeuft bewusst ohne await aus der Nachrichtenschleife heraus: der Start kann bis
+// zu zwei Minuten dauern, und solange soll der Bot weiter auf Nachrichten hoeren.
+async function rcOeffnen(cwd, hinweis) {
+  const name = rcName(cwd);
+  await send(`${hinweis ? hinweis + "\n" : ""}Öffne eine Remote-Control-Sitzung in ${kurz(cwd)} … das kann bis zu einer Minute dauern.`);
+  const r = await rcStarten(cwd, name);
+  if (!r.ok) { await send("Hat nicht geklappt: " + r.fehler); return; }
+  await send(`${r.schonDa ? "Läuft bereits" : "Sitzung offen"} — ${kurz(cwd)} auf LXC 112:\n${r.url}\n\n`
+    + `Das ist die volle Claude-Code-Oberfläche mit Rückfragen und Dateiansicht, nicht der Ein-Auftrag-Weg dieses Bots. `
+    + `Sie läuft weiter, bis du sie beendest: /rc stop ${kurz(cwd)}`);
+}
+
 async function neuStarten(pfad, name, auftrag, hinweis) {
   mutate((r) => { r.aktiv = null; r.naechstesCwd = pfad; });
   const reg = load();
@@ -646,6 +704,7 @@ async function verloreneAuftraege() {
 // allein — Telegram zeigt es erst, wenn der Bot seine Befehle einmal angemeldet hat.
 const BEFEHLE = [
   { command: "neu", description: "Projekt öffnen: klont, registriert und startet in einem Zug" },
+  { command: "rc", description: "Remote-Control-Sitzung öffnen: volle Oberfläche im Browser" },
   { command: "status", description: "Stand, Verzeichnis, Branch, PR, Außenwache" },
   { command: "sessions", description: "Alle Sessions mit Projekt und Branch" },
   { command: "wechsel", description: "Session wechseln (/wechsel 2)" },
@@ -668,6 +727,7 @@ await verloreneAuftraege();
 const HILFE = "Session-Bot bereit (LXC 112). Jede Nachricht ist ein Auftrag an die aktive Claude-Session.\n\n"
   + "/neu <repo|projekt|/pfad> [Auftrag] - klont bei Bedarf, registriert und startet in einem Zug; der Name darf unscharf sein\n"
   + "/projekte - Verzeichnisse zeigen, mit add registrieren, mit scan übernehmen\n"
+  + "/rc [projekt] - Remote-Control-Sitzung öffnen (volle Claude-Code-Oberfläche im Browser), /rc stop beendet sie\n"
   + "/direkt [aus] - für diese Session direkt auf dem Hauptbranch statt Branch+PR\n"
   + "/compact - Kontext der aktiven Session verdichten\n"
   + "/modus [standard|edits|plan|auto|voll] - Berechtigungsmodus\n"
@@ -724,6 +784,14 @@ while (true) {
               const ziel = akt.liste[parseInt(wahl, 10)];
               if (!ziel) await send("Auswahl nicht mehr gültig.");
               else await zielOeffnen(ziel, akt.auftrag, `Gewählt: ${ziel.name}.`);
+            } else if (akt.typ === "rc") {
+              const ziel = akt.liste[parseInt(wahl, 10)];
+              if (!ziel) await send("Auswahl nicht mehr gültig.");
+              else {
+                const b = await zielBereitstellen(ziel);
+                if (!b.ok) await send(b.meldung);
+                else rcOeffnen(b.pfad, `Gewählt: ${ziel.name}.`);
+              }
             } else if (akt.typ === "dirty") {
               if (wahl === "abbruch") { await send("Abgebrochen. Der Klon bleibt unverändert."); }
               else {
@@ -879,12 +947,14 @@ while (true) {
         continue;
       }
       if (text === "/status") {
+        const rcOffen = await rcListe();
         const lage = busy ? `Ein Auftrag läuft gerade${queue.length ? `, ${queue.length} in Warteschlange` : ""}.` : queue.length ? `${queue.length} in Warteschlange.` : "Bereit.";
         const wacht = !HC_URL ? "Außenwache: UNSCHARF (HC_URL nicht gesetzt) — ein Ausfall fällt niemandem auf."
           : hc.letzterFehler ? `Außenwache: FEHLER (${hc.letzterFehler.slice(0, 120)}), zuletzt ok ${hc.letzterOk ? wann(hc.letzterOk) : "nie"}`
           : `Außenwache: scharf, letzter erfolgreicher Fähigkeits-Test ${hc.letzterOk ? wann(hc.letzterOk) : "steht noch aus"}`;
-        if (cur) await send(`Aktive Session: ${cur.titel}\nVerzeichnis: ${cur.cwd || DEFAULT_CWD}\nModus: ${modusName(cur.modus)}\nModell: ${modellName(cur.modell)}\nArbeitsweise: ${cur.direkt ? "direkt auf dem Hauptbranch" : `Branch + PR${cur.branch ? ` (${cur.branch})` : ""}`}${cur.prUrl ? `\nPR: ${cur.prUrl}` : ""}\nZuletzt: ${wann(cur.zuletzt)}\n${lage}\n${wacht}\n\nAm Rechner fortsetzen:\nssh -i ~/.ssh/claude_proxmox root@${HOST}\nsu - claude\ncd "${cur.cwd || DEFAULT_CWD}" && claude --resume ${cur.id}`);
-        else await send(`Keine aktive Session. ${lage}\n${wacht}`);
+        const rcZeile = rcOffen.length ? `\nRemote Control offen: ${rcOffen.join(", ")}` : "";
+        if (cur) await send(`Aktive Session: ${cur.titel}\nVerzeichnis: ${cur.cwd || DEFAULT_CWD}\nModus: ${modusName(cur.modus)}\nModell: ${modellName(cur.modell)}\nArbeitsweise: ${cur.direkt ? "direkt auf dem Hauptbranch" : `Branch + PR${cur.branch ? ` (${cur.branch})` : ""}`}${cur.prUrl ? `\nPR: ${cur.prUrl}` : ""}\nZuletzt: ${wann(cur.zuletzt)}\n${lage}\n${wacht}${rcZeile}\n\nAm Rechner fortsetzen:\nssh -i ~/.ssh/claude_proxmox root@${HOST}\nsu - claude\ncd "${cur.cwd || DEFAULT_CWD}" && claude --resume ${cur.id}`);
+        else await send(`Keine aktive Session. ${lage}\n${wacht}${rcZeile}`);
         continue;
       }
       if (text === "/clear") {
@@ -901,6 +971,44 @@ while (true) {
         if (!cur) { await send("Keine aktive Session."); continue; }
         mutate((r) => { r.sessions = r.sessions.filter((s) => s.id !== cur.id); r.aktiv = null; });
         await send(`Abgelegt: ${cur.titel}. Das Transkript bleibt auf dem Server erhalten.`);
+        continue;
+      }
+
+      if (text === "/rc" || text.startsWith("/rc ")) {
+        const teile = text.slice(3).trim().split(/\s+/).filter(Boolean);
+        if (teile[0] === "stop") {
+          const offen = await rcListe();
+          if (!offen.length) { await send("Keine Remote-Control-Sitzung offen."); continue; }
+          const name = teile[1] ? rcName(teile[1]) : (cur ? rcName(cur.cwd || DEFAULT_CWD) : offen[0]);
+          if (!offen.includes(name)) { await send(`${name} läuft nicht. Offen: ${offen.join(", ")}`); continue; }
+          await tmux("kill-session", "-t", name);
+          await send(`Beendet: ${name}. Der Gesprächsverlauf bleibt auf dem Server, /rc öffnet eine neue Sitzung.`);
+          continue;
+        }
+        if (teile[0] === "liste") {
+          const offen = await rcListe();
+          await send(offen.length ? "Offene Remote-Control-Sitzungen:\n" + offen.map((n) => "  " + n).join("\n") : "Keine offen. /rc [projekt] macht eine auf.");
+          continue;
+        }
+        const wunsch = teile[0];
+        if (!wunsch) { rcOeffnen(cur ? (cur.cwd || DEFAULT_CWD) : DEFAULT_CWD, ""); continue; }
+        const projekte = loadProj();
+        if (wunsch.startsWith("/") && existsSync(wunsch)) { rcOeffnen(wunsch, ""); continue; }
+        if (projekte[wunsch.toLowerCase()] && existsSync(projekte[wunsch.toLowerCase()])) { rcOeffnen(projekte[wunsch.toLowerCase()], ""); continue; }
+        await send(`Suche "${wunsch}" …`);
+        const tr = await zielFinden(wunsch);
+        if (tr.art === "treffer") {
+          const b = await zielBereitstellen(tr.ziel);
+          if (!b.ok) { await send(b.meldung); continue; }
+          rcOeffnen(b.pfad, norm(tr.ziel.name) === norm(wunsch) ? "" : `Gemeint ist vermutlich ${tr.ziel.name}.`);
+        } else if (tr.art === "mehrdeutig") {
+          const id = frage({ typ: "rc", liste: tr.liste });
+          await send(tr.liste.length === 1 ? `Meintest du ${tr.liste[0].name}?` : `"${wunsch}" passt auf mehrere. Welches?`, {
+            reply_markup: { inline_keyboard: tr.liste.map((x, i) => [knopf(`${x.name}${x.quelle === "projekt" ? " (schon da)" : ""}`, id, String(i))]) },
+          });
+        } else {
+          await send(`Kein Projekt und kein eigenes Repo passt auf "${wunsch}".`);
+        }
         continue;
       }
 

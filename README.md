@@ -15,6 +15,9 @@ Der Zweck hier ist **Verfügbarkeit, nicht Bequemlichkeit**: der Bot ist die Rü
 - **Capability-Ping an healthchecks.io:** alle 30 Minuten ein winziges `claude -p`, gepingt wird nur bei `is_error: false`
 - **`/compact`** verdichtet den Kontext der aktiven Session, mit Gegenprobe am Transkript
 - **`/rc [projekt]`** öffnet eine echte Remote-Control-Sitzung und schickt die `claude.ai`-Adresse in den Chat — volle Claude-Code-Oberfläche auf dem Handy
+- **Fortschritt bei langen Aufträgen:** ab anderthalb Minuten erscheint eine Zeile („läuft seit 5 Min · 12 Schritte · zuletzt Edit auf `src/api.ts`"), die sich still fortschreibt statt jede Minute neu zu klingeln. `/fortschritt` fragt jederzeit nach
+- **Mehrere Projekte gleichzeitig:** innerhalb eines Projekts läuft ein Auftrag nach dem anderen, verschiedene Projekte laufen nebeneinander (Deckel 3)
+- **`/usage`** zeigt den Kontextverbrauch der aktiven Session — ohne einen Claude-Lauf zu kosten
 - Antworten kommen **formatiert** an (Markdown → Telegram-HTML) statt mit rohen Sternchen, und der Bot meldet ein **Befehlsmenü** bei Telegram an
 
 ## Wie es funktioniert
@@ -68,7 +71,9 @@ Und eine Falle, die hier dreimal zugeschlagen hat: **eine interaktive Claude-Sit
 | `/modus [standard\|edits\|plan\|auto\|voll]` | Berechtigungsmodus (Default hier: `voll`) |
 | `/modell [opus\|sonnet\|haiku\|standard]` | Sprachmodell je Session |
 | `/sessions` · `/wechsel N` | Sessions auflisten und wechseln |
-| `/status` | Stand, Branch, PR, Außenwache, SSH-Befehl zum Fortsetzen |
+| `/status` | Stand, laufende und wartende Aufträge, Branch, PR, Außenwache, SSH-Befehl zum Fortsetzen |
+| `/fortschritt` | Was die laufenden Aufträge gerade tun (Laufzeit, Schritte, letzter Werkzeugaufruf) |
+| `/usage` | Kontextverbrauch der aktiven Session, aus dem Transkript gelesen |
 | `/clear` · `/ende` | Kontext leeren bzw. Session ablegen (Transkript bleibt) |
 
 ## Stellschrauben
@@ -80,6 +85,8 @@ Und eine Falle, die hier dreimal zugeschlagen hat: **eine interaktive Claude-Sit
 | `telegram-session.mjs` | `DEFAULT_MODE` | hier `bypassPermissions` — bewusste Entscheidung, siehe unten |
 | `telegram-session.mjs` | `RUN_TIMEOUT` | 2 h je Auftrag |
 | `telegram-session.mjs` | `HC_INTERVAL` | Abstand der Fähigkeits-Prüfung (30 Min) |
+| `telegram-session.mjs` | `DECKEL` | wie viele Projekte gleichzeitig laufen dürfen (3) |
+| `telegram-session.mjs` | `FORTSCHRITT_AB`, `FORTSCHRITT_TAKT` | ab wann die Laufmeldung erscheint (90 s) und wie oft sie sich fortschreibt (60 s) |
 | `telegram-session.mjs` | `GH_USER`, `REPO_CACHE_TTL` | Repo-Katalog für die unscharfe Suche |
 | `telegram-session.mjs` | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` | muss größer sein als die Button-Wartezeit |
 | `permission-mcp.mjs` | `300000` in `frage()` | Wartezeit auf den Button (5 Min), danach abgelehnt |
@@ -94,6 +101,7 @@ Und eine Falle, die hier dreimal zugeschlagen hat: **eine interaktive Claude-Sit
 
 ## Versionen
 
+- **v9** (2026-09-05): Fortschritt aus dem Live-Transkript · Nebenläufigkeit je Projekt (Deckel 3) · `/usage` aus dem Original nachgebaut
 - **v8.2** (2026-09-05): `/rc` öffnet eine Remote-Control-Sitzung und schickt die Adresse
 - **v8.1** (2026-09-05): Markdown-Formatierung, Umlaute, Befehlsmenü, keine leeren Branches mehr
 - **v8** (2026-09-05): `/neu` mit Auto-Klonen und unscharfer Suche · Branch + PR als Default · persistente Warteschlange · Timeout 2 h · Capability-Ping · `/compact`

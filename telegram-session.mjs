@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Session-Bot v8 (LXC 112) — steuert Claude-Code-Sessions per Telegram.
+// Session-Bot v9 (LXC 112) — steuert Claude-Code-Sessions per Telegram.
 // Abgeleitet von AlphaGenX/claude-telegram-session-bot v6.1 (MIT), mit sechs Korrekturen:
 //   1. MODI.standard: "default" existiert nicht mehr -> "manual"
 //   2. CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT statt MCP_TOOL_TIMEOUT (der echte Killer)
@@ -14,9 +14,14 @@
 //   B6 Timeout 30 Min -> 2 h, Abbruch wird als Zwischenstand gemeldet
 //   B7 Capability-Ping an healthchecks.io (nur bei is_error: false)
 //   dazu /compact (verifiziert: komprimiert per --resume wirklich)
+// v9 (2026-09-05) — Ausbaustufe 3, dazu /usage aus dem Original (v7, nachgebaut statt gepickt):
+//   B3 Fortschritt aus dem Live-Transkript: eine Laufmeldung, die sich selbst fortschreibt,
+//      plus /fortschritt auf Zuruf. Eine Transkript-Schicht bedient beides und /usage.
+//   B4 Nebenläufigkeit je Projekt: gleiches Projekt weiter seriell, verschiedene parallel,
+//      Deckel bei 3. Die aktive Session wird dafür je Projekt geführt (reg.aktivJe).
 // Befehle: /neu [repo|projekt|/pfad] [Auftrag], /projekte [add|scan], /direkt, /compact,
-//          /modus, /modell, /sessions, /wechsel N, /status, /clear, /ende
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
+//          /modus, /modell, /sessions, /wechsel N, /status, /usage, /fortschritt, /clear, /ende
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 
@@ -44,6 +49,17 @@ const REPO_CACHE_TTL = 6 * 3600 * 1000;   // 6 h
 // (Muster aus dem Dead-Man-Switch-Runbook des Proxmox-Hosts).
 const HC_URL = (process.env.HC_URL || "").trim();
 const HC_INTERVAL = 30 * 60 * 1000;
+// B4: Deckel bei 3 gleichzeitigen Läufen — 8 GB RAM, und jeder --resume zieht ein
+// Vielfaches der Transkriptgröße. Innerhalb eines Projekts bleibt es seriell.
+const DECKEL = 3;
+// B3: die Laufmeldung erscheint erst, wenn ein Auftrag wirklich lange braucht, und
+// schreibt sich danach still fort (editMessageText löst keine Benachrichtigung aus).
+const FORTSCHRITT_AB = 90000;
+const FORTSCHRITT_TAKT = 60000;
+// Bis ein Lauf das echte Kontextfenster gemeldet hat, bleibt nur der Modellname.
+// 200k ist der Normalfall; die [1m]-Varianten tragen ihr Fenster im Namen.
+const FENSTER_FALLBACK = 200000;
+const fensterRaten = (modell) => (/\[1m\]/i.test(String(modell || "")) ? 1000000 : FENSTER_FALLBACK);
 
 // Korrektur 4: Token und Chat-ID NICHT an den Claude-Subprozess weiterreichen.
 // Sonst kann ein per Prompt Injection gekaperter Agent den Bot-Token lesen und an
@@ -67,7 +83,11 @@ const modusName = (wert) => (Object.entries(MODI).find(([, v]) => v === (wert ||
 const MODELLE = { opus: "claude-opus-5", sonnet: "claude-sonnet-5", haiku: "claude-haiku-4-5" };
 const modellName = (wert) => (Object.entries(MODELLE).find(([, v]) => v === wert) || ["standard"])[0];
 
-const LEER = { sessions: [], aktiv: null, naechstesCwd: null, naechsterModus: null, naechstesModell: null, naechsterDirekt: false, warteschlange: [], laufend: null };
+// aktivJe: Projektpfad -> Session-ID. Mit Nebenläufigkeit reicht ein globales "aktiv"
+// nicht mehr — zwei Läufe in verschiedenen Projekten würden sonst dieselbe Session greifen.
+// reg.aktiv bleibt daneben bestehen: die Session, die der Nutzer gerade ansieht.
+// laufende: Array statt Einzelwert (laufend), damit ein Neustart alle offenen Läufe kennt.
+const LEER = { sessions: [], aktiv: null, aktivJe: {}, naechstesCwd: null, naechsterModus: null, naechstesModell: null, naechsterDirekt: false, warteschlange: [], laufende: [], laufend: null };
 const load = () => { try { return { ...LEER, ...JSON.parse(readFileSync(REG, "utf8")) }; } catch { return { ...LEER }; } };
 const save = (r) => writeFileSync(REG, JSON.stringify(r, null, 2), { mode: 0o600 });
 // Immer frisch laden, ändern, schreiben. pump() und die Nachrichtenschleife laufen
@@ -81,6 +101,7 @@ const kurz = (cwd) => {
   return hit ? hit[0] : c.split("/").filter(Boolean).pop();
 };
 const wann = (t) => new Date(t).toLocaleString("de-DE", { timeZone: "Europe/Berlin", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+const tsd = (n) => Number(n).toLocaleString("de-DE");
 const DAUER = "Antwort kommt meist unter einer Minute, größere Aufträge brauchen länger.";
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const fehler = (...a) => console.error(new Date().toISOString(), ...a);
@@ -490,47 +511,213 @@ function runClaude(auftrag, resumeId, cwd, modus, modell) {
         const grund = j.result || j.api_error_status || j.terminal_reason || "unbekannter API-Fehler";
         return resolve({ ok: false, error: `Claude meldet einen Fehler: ${String(grund).slice(0, 400)}`, sid: j.session_id || resumeId || null });
       }
-      resolve({ ok: true, result: j.result || "(kein Ergebnis)", sid: j.session_id || resumeId || null });
+      // Das echte Kontextfenster meldet nur der Lauf selbst. Wir merken es uns am
+      // Haupt-Modell (der modelUsage-Eintrag mit den meisten Input-Token) — sonst
+      // müsste /usage mit einer geratenen Zahl rechnen. Übernommen aus Upstream v7.
+      let fenster = null, meiste = -1;
+      for (const mu of Object.values(j.modelUsage || {})) {
+        const inp = (mu.inputTokens || 0) + (mu.cacheReadInputTokens || 0) + (mu.cacheCreationInputTokens || 0);
+        if (mu.contextWindow && inp > meiste) { meiste = inp; fenster = mu.contextWindow; }
+      }
+      resolve({ ok: true, result: j.result || "(kein Ergebnis)", sid: j.session_id || resumeId || null, fenster });
     });
     kind.stdin.end(); // sonst wartet Claude 3 Sekunden auf stdin
   });
 }
 
 // ---------------------------------------------------------------------------
-// B5: persistente Warteschlange
+// B3: die Transkript-Schicht. Claude Code schreibt jeden Lauf als JSONL mit; daraus
+// kommen drei Dinge, die der Bot sonst nicht wüsste: der Fortschritt eines laufenden
+// Auftrags, der Kontextverbrauch (/usage) und die Gegenprobe für /compact.
+//
+// Bewusst gepollt statt --output-format stream-json: der Streaming-Weg baut genau die
+// Teile um, die heute tragen (is_error-Prüfung und Warteschlange). Lesen kostet nichts.
 // ---------------------------------------------------------------------------
-const queue = [];
-let busy = false;
+const projektDir = (cwd) => `${HOME}/.claude/projects/${String(cwd || DEFAULT_CWD).replace(/[^a-zA-Z0-9]/g, "-")}`;
+const transkriptPfad = (cwd, sid) => `${projektDir(cwd)}/${sid}.jsonl`;
+
+// Bekannte Kante (Grill Q7): bei einer NEUEN Session steht die ID erst am Ende fest.
+// Solange je Projekt nur ein Lauf gleichzeitig läuft (B4), ist die jüngste Datei im
+// Projektverzeichnis eindeutig. Wird dieser Deckel je gelockert, bricht diese Stelle zuerst.
+function juengstesTranskript(cwd, seit) {
+  const dir = projektDir(cwd);
+  let best = null, bestZeit = -1;
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".jsonl")) continue;
+      const p = `${dir}/${name}`;
+      let m;
+      try { m = statSync(p).mtimeMs; } catch { continue; }
+      if (seit && m < seit - 60000) continue; // älter als der Lauf: gehört nicht dazu
+      if (m > bestZeit) { bestZeit = m; best = p; }
+    }
+  } catch { return null; }
+  return best;
+}
+
+// Die Datei zur Session finden: mit ID direkt, sonst über die jüngste im Projekt.
+function transkriptFinden(cwd, sid, seit) {
+  if (sid) {
+    const p = transkriptPfad(cwd, sid);
+    if (existsSync(p)) return p;
+    // --resume kann die Session in ein anderes Projektverzeichnis geschrieben haben
+    try {
+      for (const dir of readdirSync(`${HOME}/.claude/projects`)) {
+        const q = `${HOME}/.claude/projects/${dir}/${sid}.jsonl`;
+        if (existsSync(q)) return q;
+      }
+    } catch {}
+  }
+  return juengstesTranskript(cwd, seit);
+}
+
+const zeilen = (pfad) => { try { return readFileSync(pfad, "utf8").split("\n").filter(Boolean); } catch { return null; } };
+const grenzen = (pfad) => { const z = zeilen(pfad); return z ? z.filter((x) => x.includes("compact_boundary")).length : -1; };
+
+// Womit ist Claude gerade beschäftigt? Aus dem Werkzeugaufruf das herausziehen, was
+// ein Mensch am Handy wiedererkennt — Dateiname, Befehl, Suchbegriff. Nicht das ganze Argument.
+function werkzeugText(name, input) {
+  const i = input || {};
+  const datei = i.file_path || i.path || i.notebook_path;
+  if (datei) return `${name} auf ${String(datei).split("/").slice(-2).join("/")}`;
+  if (i.command) return `${name}: ${String(i.command).replace(/\s+/g, " ").slice(0, 60)}`;
+  if (i.pattern || i.query) return `${name}: ${String(i.pattern || i.query).slice(0, 60)}`;
+  if (i.url) return `${name}: ${String(i.url).slice(0, 60)}`;
+  if (i.description) return `${name}: ${String(i.description).slice(0, 60)}`;
+  return name;
+}
+
+// Ein Durchlauf, zwei Antworten: Fortschritt (Schritte, letzter Werkzeugaufruf) und
+// Kontextstand (letzte assistant-Zeile mit usage). Subagenten (isSidechain) zählen nicht
+// mit — sonst meldet ein Fan-out Schritte, die nicht die Hauptarbeit sind.
+function transkriptLesen(pfad, seit) {
+  const z = zeilen(pfad);
+  if (!z) return null;
+  let schritte = 0, zuletzt = null, kontext = 0, modell = null, letzteZeit = null;
+  for (const roh of z) {
+    let j;
+    try { j = JSON.parse(roh); } catch { continue; }
+    if (j.isSidechain) continue;
+    const ts = j.timestamp ? Date.parse(j.timestamp) : null;
+    if (j.type === "assistant" && j.message) {
+      if (j.message.usage) {
+        const u = j.message.usage;
+        const k = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+        if (k > 0) { kontext = k; modell = j.message.model || modell; }
+      }
+      for (const b of j.message.content || []) {
+        if (b.type !== "tool_use") continue;
+        if (!seit || !ts || ts >= seit) { schritte++; zuletzt = werkzeugText(b.name, b.input); letzteZeit = ts; }
+      }
+    }
+  }
+  return { schritte, zuletzt, letzteZeit, kontext, modell };
+}
+
+const dauerText = (ms) => {
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return "unter einer Minute";
+  if (min < 60) return `${min} Min`;
+  return `${Math.floor(min / 60)} h ${min % 60} Min`;
+};
+
+// ---------------------------------------------------------------------------
+// B5 + B4: persistente Warteschlange, je Projekt eine eigene.
+//
+// Vorher gab es eine Liste und ein busy-Flag für alles. Damit stand ein Auftrag im
+// Vault hinter einem halbstündigen Refactoring in einem ganz anderen Projekt. Jetzt
+// hat jedes Projekt seine eigene Reihe und läuft für sich — innerhalb eines Projekts
+// weiter streng nacheinander, sonst kollidieren zwei Läufe in denselben Dateien.
+// ---------------------------------------------------------------------------
+const queues = new Map();   // Projektpfad -> Liste wartender Aufträge
+const laufend = new Map();  // Projektpfad -> gerade laufender Auftrag
+const qKey = (cwd) => cwd || DEFAULT_CWD;
+const qWartend = () => [...queues.values()].reduce((n, l) => n + l.length, 0);
 
 function qPush(item) {
-  queue.push(item);
+  const k = qKey(item.cwd);
+  if (!queues.has(k)) queues.set(k, []);
+  queues.get(k).push(item);
   mutate((r) => { r.warteschlange = [...(r.warteschlange || []), item]; });
-  return queue.length;
+  return queues.get(k).length + (laufend.has(k) ? 1 : 0);
 }
-function qShift() {
-  const item = queue.shift();
-  mutate((r) => { r.warteschlange = (r.warteschlange || []).filter((x) => x.qid !== item.qid); r.laufend = item; });
-  return item;
-}
-const qFertig = () => mutate((r) => { r.laufend = null; });
 
-async function pump() {
-  if (busy) return;
-  busy = true;
-  try {
-    while (queue.length) {
-      const item = qShift();
-      try { await auftragAusfuehren(item); }
-      catch (e) { fehler("Auftrag:", (e && e.stack) || e); await send("Interner Fehler beim Auftrag: " + String((e && e.message) || e).slice(0, 300)); }
-      qFertig();
-    }
-  } finally { busy = false; qFertig(); }
+// Absichtlich synchron und ohne await: pump() startet, was starten darf, und kehrt
+// sofort zurück. Jeder Lauf ruft am Ende selbst wieder pump() — so rückt die Reihe
+// nach, ohne dass ein globales busy-Flag nötig wäre.
+function pump() {
+  for (const [k, liste] of queues) {
+    if (!liste.length || laufend.has(k)) continue;
+    if (laufend.size >= DECKEL) return;
+    const item = liste.shift();
+    laufend.set(k, { ...item, start: Date.now() });
+    mutate((r) => {
+      r.warteschlange = (r.warteschlange || []).filter((x) => x.qid !== item.qid);
+      r.laufende = [...(r.laufende || []), item];
+    });
+    lauf(k, item);
+  }
+}
+
+async function lauf(k, item) {
+  try { await auftragAusfuehren(item); }
+  catch (e) { fehler("Auftrag:", (e && e.stack) || e); await send("Interner Fehler beim Auftrag: " + String((e && e.message) || e).slice(0, 300)); }
+  finally {
+    laufend.delete(k);
+    mutate((r) => { r.laufende = (r.laufende || []).filter((x) => x.qid !== item.qid); r.laufend = null; });
+    pump();
+  }
+}
+
+// B3: eine Meldung je Lauf, die sich selbst fortschreibt. Sie erscheint erst nach
+// FORTSCHRITT_AB — bei kurzen Aufträgen wäre sie nur Lärm — und wird danach editiert
+// statt neu gesendet. Ein Edit klingelt nicht auf dem Handy, eine neue Nachricht schon.
+function fortschrittsMelder(cwd, sidBekannt, titel) {
+  const start = Date.now();
+  let msgId = null, aus = false;
+  const zeile = () => {
+    const pfad = transkriptFinden(cwd, sidBekannt, start);
+    const t = pfad ? transkriptLesen(pfad, start) : null;
+    const kopf = `${titel} läuft seit ${dauerText(Date.now() - start)}`;
+    if (!t || !t.schritte) return `${kopf}. Noch kein Schritt im Protokoll.`;
+    return `${kopf} · ${t.schritte} ${t.schritte === 1 ? "Schritt" : "Schritte"}${t.zuletzt ? ` · zuletzt ${t.zuletzt}` : ""}`;
+  };
+  const tick = async () => {
+    if (aus) return;
+    try {
+      if (!msgId) {
+        const r = await tg("sendMessage", { chat_id: CHAT_ID, text: zeile().slice(0, 4000), disable_notification: true });
+        msgId = r?.result?.message_id || null;
+      } else {
+        await tg("editMessageText", { chat_id: CHAT_ID, message_id: msgId, text: zeile().slice(0, 4000) });
+      }
+    } catch (e) { fehler("Fortschritt:", (e && e.message) || e); }
+  };
+  // Erst nach FORTSCHRITT_AB überhaupt erscheinen, danach im Takt fortschreiben.
+  // Das Intervall startet deshalb im Timeout und nicht daneben — sonst läge der
+  // zweite Stand bei AB+TAKT statt bei TAKT nach dem ersten.
+  let takt = null;
+  const ersteAnzeige = setTimeout(() => { tick(); takt = setInterval(tick, FORTSCHRITT_TAKT); }, FORTSCHRITT_AB);
+  return {
+    async ende(schluss) {
+      aus = true;
+      clearTimeout(ersteAnzeige); if (takt) clearInterval(takt);
+      if (!msgId) return; // gar nicht erst erschienen: nichts aufzuräumen
+      const pfad = transkriptFinden(cwd, sidBekannt, start);
+      const t = pfad ? transkriptLesen(pfad, start) : null;
+      const text = `${titel}: ${schluss} nach ${dauerText(Date.now() - start)}${t?.schritte ? ` · ${t.schritte} Schritte` : ""}`;
+      await tg("editMessageText", { chat_id: CHAT_ID, message_id: msgId, text: text.slice(0, 4000) });
+    },
+  };
 }
 
 async function auftragAusfuehren(item) {
   const reg = load();
-  const cur = reg.sessions.find((s) => s.id === reg.aktiv) || null;
-  const cwd = cur ? (cur.cwd || DEFAULT_CWD) : (item.cwd || reg.naechstesCwd || DEFAULT_CWD);
+  const cwd = item.cwd || reg.naechstesCwd || DEFAULT_CWD;
+  // B4: die aktive Session kommt aus dem Projekt, nicht aus einem globalen Zeiger —
+  // sonst greifen zwei parallele Läufe dieselbe Session und resümieren durcheinander.
+  const sid0 = (reg.aktivJe || {})[cwd] || null;
+  const cur = sid0 ? reg.sessions.find((s) => s.id === sid0) || null : null;
   const modus = cur ? (cur.modus || DEFAULT_MODE) : (reg.naechsterModus || DEFAULT_MODE);
   const modell = cur ? (cur.modell || null) : (reg.naechstesModell || null);
   const direkt = cur ? !!cur.direkt : !!reg.naechsterDirekt;
@@ -545,29 +732,43 @@ async function auftragAusfuehren(item) {
   }
 
   const prompt = bi.branch ? branchHinweis(bi) + item.text : item.text;
-  const r = await runClaude(prompt, cur ? cur.id : null, cwd, modus, modell);
+  const melder = fortschrittsMelder(cwd, cur ? cur.id : null, kurz(cwd));
+  let r;
+  try { r = await runClaude(prompt, cur ? cur.id : null, cwd, modus, modell); }
+  catch (e) { await melder.ende("fehlgeschlagen"); throw e; }
 
   // Session festhalten — auch wenn der Lauf schiefging, solange eine ID bekannt ist.
   const sid = r.sid || (cur ? cur.id : null);
   mutate((reg2) => {
+    if (!reg2.aktivJe) reg2.aktivJe = {};
     if (cur) {
       const s = reg2.sessions.find((x) => x.id === cur.id);
       if (s) {
         s.id = sid || s.id; s.zuletzt = Date.now();
+        if (r.fenster) s.fenster = r.fenster;
         if (bi.branch) { s.branch = bi.branch; s.base = bi.base; }
       }
       if (reg2.aktiv === cur.id) reg2.aktiv = sid || cur.id;
+      reg2.aktivJe[cwd] = sid || cur.id;
     } else if (sid && !reg2.sessions.some((x) => x.id === sid)) {
-      reg2.sessions.push({ id: sid, titel: item.text.slice(0, 48), cwd, modus, modell, direkt, base: bi.base, branch: bi.branch, prUrl: null, erstellt: Date.now(), zuletzt: Date.now() });
+      reg2.sessions.push({ id: sid, titel: item.text.slice(0, 48), cwd, modus, modell, direkt, base: bi.base, branch: bi.branch, prUrl: null, fenster: r.fenster || null, erstellt: Date.now(), zuletzt: Date.now() });
       if (reg2.sessions.length > 15) reg2.sessions = reg2.sessions.slice(-15);
       if (!reg2.aktiv) reg2.aktiv = sid;
-      reg2.naechstesCwd = null; reg2.naechsterModus = null; reg2.naechstesModell = null; reg2.naechsterDirekt = false;
+      reg2.aktivJe[cwd] = sid;
+      // Die "nächste Session"-Vorgaben gelten nur für das Projekt, das sie eröffnet hat.
+      if (reg2.naechstesCwd === cwd || !reg2.naechstesCwd) reg2.naechstesCwd = null;
+      reg2.naechsterModus = null; reg2.naechstesModell = null; reg2.naechsterDirekt = false;
     }
   });
 
-  if (r.ok) await send(r.result);
-  else if (r.abbruch) await send(`${r.error}\nDas ist ein Zwischenstand, kein Totalverlust: die Arbeit liegt in ${cwd}${bi.branch ? ` im Branch ${bi.branch}` : ""}. Mit einem neuen Auftrag im selben Projekt geht es weiter.`);
-  else await send("Fehlgeschlagen: " + r.error);
+  await melder.ende(r.ok ? "fertig" : r.abbruch ? "abgebrochen" : "fehlgeschlagen");
+
+  // B4: laufen mehrere Projekte gleichzeitig, kommen die Antworten verschränkt an.
+  // Ohne Absender weiß man am Handy nicht, zu welchem Auftrag eine Antwort gehört.
+  const abs = laufend.size > 1 ? `[${kurz(cwd)}]\n` : "";
+  if (r.ok) await send(abs + r.result);
+  else if (r.abbruch) await send(`${abs}${r.error}\nDas ist ein Zwischenstand, kein Totalverlust: die Arbeit liegt in ${cwd}${bi.branch ? ` im Branch ${bi.branch}` : ""}. Mit einem neuen Auftrag im selben Projekt geht es weiter.`);
+  else await send(abs + "Fehlgeschlagen: " + r.error);
 
   // B6: der PR-Abschluss läuft auch nach Abbruch und Fehler — genau dann ist er wertvoll.
   try {
@@ -617,21 +818,22 @@ setTimeout(capabilityPing, 20000);
 setInterval(capabilityPing, HC_INTERVAL);
 
 // ---------------------------------------------------------------------------
-// /compact — verifiziert am 2026-09-05: komprimiert per --resume wirklich.
-// num_turns: 0 und leeres result sind die normale Signatur eines Slash-Commands
-// im -p-Modus, kein Nichtstun. Beleg ist der compact_boundary im Transkript.
-// ---------------------------------------------------------------------------
-const transkriptPfad = (cwd, sid) => `${HOME}/.claude/projects/${String(cwd).replace(/[^a-zA-Z0-9]/g, "-")}/${sid}.jsonl`;
-function grenzen(pfad) {
-  try { return (readFileSync(pfad, "utf8").match(/compact_boundary/g) || []).length; } catch { return -1; }
-}
-
-// ---------------------------------------------------------------------------
 // Auftrag einreihen (gemeinsamer Weg für /neu und freie Nachrichten)
 // ---------------------------------------------------------------------------
+// B4: Das Ziel-Projekt wird beim Einreihen festgelegt, nicht beim Ausführen. Sonst
+// läse ein Auftrag, der zehn Minuten in der Reihe stand, am Ende die inzwischen
+// gewechselte aktive Session — und liefe im falschen Verzeichnis.
 async function einreihen(text, cwd, meldungWennFrei) {
-  const pos = qPush({ qid: kurzId(), text, cwd: cwd || null, ts: Date.now() });
-  await send(busy ? `Eingereiht, Position ${pos}.` : meldungWennFrei);
+  const reg = load();
+  const cur = reg.sessions.find((s) => s.id === reg.aktiv) || null;
+  const ziel = cwd || (cur ? cur.cwd || DEFAULT_CWD : reg.naechstesCwd || DEFAULT_CWD);
+  const k = qKey(ziel);
+  const wartetHier = laufend.has(k) || (queues.get(k) || []).length > 0;
+  const deckelVoll = !laufend.has(k) && laufend.size >= DECKEL;
+  const pos = qPush({ qid: kurzId(), text, cwd: ziel, ts: Date.now() });
+  if (wartetHier) await send(`Eingereiht in ${kurz(ziel)}, Position ${pos}. Innerhalb eines Projekts läuft ein Auftrag nach dem anderen.`);
+  else if (deckelVoll) await send(`Eingereiht in ${kurz(ziel)}. Es laufen bereits ${DECKEL} Aufträge gleichzeitig — mehr geht nicht, der Auftrag startet, sobald einer fertig ist.`);
+  else await send(meldungWennFrei);
   pump();
 }
 
@@ -648,7 +850,9 @@ async function rcOeffnen(cwd, hinweis) {
 }
 
 async function neuStarten(pfad, name, auftrag, hinweis) {
-  mutate((r) => { r.aktiv = null; r.naechstesCwd = pfad; });
+  // aktivJe für genau dieses Projekt löschen: der nächste Lauf dort soll frisch
+  // beginnen. Andere Projekte behalten ihre laufende Session.
+  mutate((r) => { r.aktiv = null; if (!r.aktivJe) r.aktivJe = {}; delete r.aktivJe[pfad]; r.naechstesCwd = pfad; });
   const reg = load();
   const wie = reg.naechsterDirekt ? "direkt auf dem Hauptbranch" : "auf einem eigenen Branch mit PR";
   const kopf = (hinweis ? hinweis + "\n" : "") + `Neue Session in ${name} (${pfad}), ${wie}.`;
@@ -683,14 +887,17 @@ async function zielOeffnen(ziel, auftrag, vorHinweis) {
 // ---------------------------------------------------------------------------
 async function verloreneAuftraege() {
   const r = load();
-  const offen = [...(r.laufend ? [r.laufend] : []), ...(r.warteschlange || [])];
+  // r.laufend ist der Einzelwert aus v8 — beim ersten Start nach dem Update kann er
+  // noch belegt sein. Deshalb beide Formen lesen, nur die neue schreiben.
+  const liefen = [...(r.laufende || []), ...(r.laufend ? [r.laufend] : [])];
+  const offen = [...liefen, ...(r.warteschlange || [])];
   if (!offen.length) return;
-  mutate((x) => { x.warteschlange = []; x.laufend = null; });
+  mutate((x) => { x.warteschlange = []; x.laufende = []; x.laufend = null; });
   const id = frage({ typ: "queue", items: offen });
-  const liste = offen.map((x, i) => `${i + 1}. ${String(x.text).slice(0, 90)}`).join("\n");
+  const liste = offen.map((x, i) => `${i + 1}. ${x.cwd ? `[${kurz(x.cwd)}] ` : ""}${String(x.text).slice(0, 90)}`).join("\n");
   await send(
     `Beim letzten Stopp waren ${offen.length} Aufträge offen — sie wurden nicht ausgeführt:\n${liste}\n\n`
-    + `${r.laufend ? "Der erste lief bereits, seine Arbeit kann teilweise auf der Platte liegen.\n" : ""}Was soll damit passieren?`,
+    + `${liefen.length ? `${liefen.length === 1 ? "Einer lief bereits, seine" : `${liefen.length} liefen bereits, ihre`} Arbeit kann teilweise auf der Platte liegen.\n` : ""}Was soll damit passieren?`,
     { reply_markup: { inline_keyboard: [
       [knopf("Alle erneut einreihen", id, "alle")],
       [knopf("Verwerfen", id, "weg")],
@@ -706,6 +913,8 @@ const BEFEHLE = [
   { command: "neu", description: "Projekt öffnen: klont, registriert und startet in einem Zug" },
   { command: "rc", description: "Remote-Control-Sitzung öffnen: volle Oberfläche im Browser" },
   { command: "status", description: "Stand, Verzeichnis, Branch, PR, Außenwache" },
+  { command: "fortschritt", description: "Was die laufenden Aufträge gerade tun" },
+  { command: "usage", description: "Kontextverbrauch der aktiven Session" },
   { command: "sessions", description: "Alle Sessions mit Projekt und Branch" },
   { command: "wechsel", description: "Session wechseln (/wechsel 2)" },
   { command: "direkt", description: "Direkt auf dem Hauptbranch statt Branch + PR" },
@@ -719,9 +928,21 @@ const BEFEHLE = [
 ];
 
 let offset = 0;
-log(`Session-Bot v8 gestartet (LXC 112, User claude). Capability-Ping: ${HC_URL ? "scharf" : "UNSCHARF (HC_URL fehlt)"}`);
+log(`Session-Bot v9 gestartet (LXC 112, User claude). Deckel ${DECKEL} Läufe. Capability-Ping: ${HC_URL ? "scharf" : "UNSCHARF (HC_URL fehlt)"}`);
 const menue = await tg("setMyCommands", { commands: BEFEHLE });
 if (!menue?.ok) fehler("Befehlsmenü konnte nicht gesetzt werden:", (menue && menue.description) || "");
+
+// Übergang von v8: dort gab es nur einen globalen "aktiv"-Zeiger. Ohne diese Übernahme
+// fände der erste Auftrag nach dem Update in seinem Projekt keine Session, würde eine
+// neue eröffnen — und der laufende Gesprächsfaden wäre still weg.
+mutate((r) => {
+  if (!r.aktivJe) r.aktivJe = {};
+  if (!Object.keys(r.aktivJe).length && r.aktiv) {
+    const s = r.sessions.find((x) => x.id === r.aktiv);
+    if (s) { r.aktivJe[s.cwd || DEFAULT_CWD] = s.id; log(`v8-Übergang: aktive Session ${String(s.id).slice(0, 8)} an ${s.cwd || DEFAULT_CWD} gebunden`); }
+  }
+});
+
 await verloreneAuftraege();
 
 const HILFE = "Session-Bot bereit (LXC 112). Jede Nachricht ist ein Auftrag an die aktive Claude-Session.\n\n"
@@ -735,8 +956,12 @@ const HILFE = "Session-Bot bereit (LXC 112). Jede Nachricht ist ein Auftrag an d
   + "/sessions - alle Sessions\n"
   + "/wechsel N - Session wechseln\n"
   + "/status - Stand plus SSH-Befehl zum Fortsetzen\n"
+  + "/fortschritt - was die laufenden Aufträge gerade tun\n"
+  + "/usage - Kontextverbrauch der aktiven Session\n"
   + "/clear - Kontext leeren\n"
   + "/ende - aktive Session ablegen\n\n"
+  + `Verschiedene Projekte laufen nebeneinander (höchstens ${DECKEL} gleichzeitig), innerhalb eines Projekts nacheinander. `
+  + "Dauert ein Auftrag länger als anderthalb Minuten, meldet sich der Bot mit einer Zeile, die er still fortschreibt.\n\n"
   + "Standard ist Branch + Pull Request: der Bot legt vor dem Lauf einen Branch an und öffnet danach den PR. "
   + "Web-Suche ist erlaubt. Braucht Claude weitere Rechte, kommt eine Freigabe-Anfrage mit Buttons. " + DAUER;
 
@@ -856,6 +1081,51 @@ while (true) {
         continue;
       }
 
+      // /usage — Kontextverbrauch der angesehenen Session. Nachgebaut aus Upstream v7
+      // (f9f7721), nicht gepickt: dort zeigen die Pfade auf /root, und die Ausgabe muss
+      // durch unsere Formatierungsschicht. Das Lesen selbst macht die Transkript-Schicht.
+      if (text === "/usage") {
+        if (!cur) { await send("Keine aktive Session. Schick einen Auftrag oder /neu."); continue; }
+        const pfad = transkriptFinden(cur.cwd || DEFAULT_CWD, cur.id, null);
+        const t = pfad ? transkriptLesen(pfad, null) : null;
+        if (!t || !t.kontext) { await send(`Zur Session "${cur.titel}" liegt noch kein Transkript mit Verbrauch vor — vermutlich lief noch kein Auftrag durch.`); continue; }
+        const fenster = cur.fenster || fensterRaten(t.modell);
+        // Eine geratene Zahl, die kleiner ist als der gemessene Verbrauch, ist keine
+        // Schätzung mehr, sondern falsch. Dann lieber nur den Verbrauch zeigen.
+        if (!cur.fenster && t.kontext > fenster) {
+          await send(`Kontext der Session "${cur.titel}" [${kurz(cur.cwd)}]: ${tsd(t.kontext)} Token.\n`
+            + `Das Kontextfenster dieser Session ist noch nicht bekannt — der nächste Auftrag meldet es, danach zeigt /usage auch den Anteil.\n`
+            + `Modell: ${t.modell || modellName(cur.modell)}`);
+          continue;
+        }
+        const prozent = Math.min(100, Math.round((t.kontext / fenster) * 100));
+        const balken = "█".repeat(Math.round(prozent / 5)).padEnd(20, "░");
+        await send(`Kontext der Session "${cur.titel}" [${kurz(cur.cwd)}]:\n\`${balken}\` ${prozent} %\n`
+          + `${tsd(t.kontext)} von ${tsd(fenster)} Token${cur.fenster ? "" : " (Fenster geschätzt, nach dem nächsten Auftrag exakt)"}\n`
+          + `Modell: ${t.modell || modellName(cur.modell)}`
+          + (prozent >= 70 ? "\n\nWird es eng: /compact verdichtet, /clear leert. Das Verzeichnis bleibt in beiden Fällen." : ""));
+        continue;
+      }
+
+      // B3: Fortschritt auf Zuruf. Die laufenden Aufträge melden sich zwar von selbst,
+      // aber erst nach anderthalb Minuten — und der Blick zwischendurch kostet nichts.
+      if (text === "/fortschritt") {
+        if (!laufend.size) { await send(qWartend() ? `Kein Auftrag läuft gerade, ${qWartend()} warten in der Reihe.` : "Kein Auftrag läuft gerade."); continue; }
+        const aktivJe = reg.aktivJe || {};
+        const raus = [];
+        for (const [k, it] of laufend) {
+          const pfad = transkriptFinden(k, aktivJe[k] || null, it.start);
+          const t = pfad ? transkriptLesen(pfad, it.start) : null;
+          raus.push(`${kurz(k)} — seit ${dauerText(Date.now() - it.start)}`
+            + (t && t.schritte ? ` · ${t.schritte} ${t.schritte === 1 ? "Schritt" : "Schritte"}` : " · noch kein Schritt im Protokoll")
+            + (t && t.zuletzt ? `\nzuletzt ${t.zuletzt}` : "")
+            + `\nAuftrag: ${String(it.text).slice(0, 100)}`);
+        }
+        const wartet = qWartend();
+        await send(raus.join("\n\n") + (wartet ? `\n\nDazu ${wartet} in der Warteschlange.` : ""));
+        continue;
+      }
+
       if (text === "/modus" || text.startsWith("/modus ")) {
         const arg = text.slice(6).trim().toLowerCase();
         if (!arg) {
@@ -942,13 +1212,16 @@ while (true) {
         const n = parseInt(text.split(/\s+/)[1], 10);
         const ziel = reg.sessions[n - 1];
         if (!ziel) { await send("Unbekannte Nummer. /sessions zeigt die Liste."); continue; }
-        mutate((r) => { r.aktiv = ziel.id; });
+        mutate((r) => { r.aktiv = ziel.id; if (!r.aktivJe) r.aktivJe = {}; r.aktivJe[ziel.cwd || DEFAULT_CWD] = ziel.id; });
         await send(`Aktiv: ${ziel.titel} [${kurz(ziel.cwd)}, ${modusName(ziel.modus)}, ${modellName(ziel.modell)}]${ziel.branch ? `\nBranch: ${ziel.branch}` : ""}${ziel.prUrl ? `\nPR: ${ziel.prUrl}` : ""}`);
         continue;
       }
       if (text === "/status") {
         const rcOffen = await rcListe();
-        const lage = busy ? `Ein Auftrag läuft gerade${queue.length ? `, ${queue.length} in Warteschlange` : ""}.` : queue.length ? `${queue.length} in Warteschlange.` : "Bereit.";
+        const wartet = qWartend();
+        const lage = laufend.size
+          ? `${laufend.size === 1 ? "Ein Auftrag läuft" : `${laufend.size} Aufträge laufen`} gerade (${[...laufend.keys()].map(kurz).join(", ")})${wartet ? `, ${wartet} in Warteschlange` : ""}.`
+          : wartet ? `${wartet} in Warteschlange.` : "Bereit.";
         const wacht = !HC_URL ? "Außenwache: UNSCHARF (HC_URL nicht gesetzt) — ein Ausfall fällt niemandem auf."
           : hc.letzterFehler ? `Außenwache: FEHLER (${hc.letzterFehler.slice(0, 120)}), zuletzt ok ${hc.letzterOk ? wann(hc.letzterOk) : "nie"}`
           : `Außenwache: scharf, letzter erfolgreicher Fähigkeits-Test ${hc.letzterOk ? wann(hc.letzterOk) : "steht noch aus"}`;
@@ -961,7 +1234,8 @@ while (true) {
         if (!cur) { await send("Keine aktive Session. /neu startet frisch."); continue; }
         mutate((r) => {
           r.sessions = r.sessions.filter((s) => s.id !== cur.id);
-          r.aktiv = null; r.naechstesCwd = cur.cwd || DEFAULT_CWD; r.naechsterModus = cur.modus || null;
+          r.aktiv = null; if (!r.aktivJe) r.aktivJe = {}; delete r.aktivJe[cur.cwd || DEFAULT_CWD];
+          r.naechstesCwd = cur.cwd || DEFAULT_CWD; r.naechsterModus = cur.modus || null;
           r.naechstesModell = cur.modell || null; r.naechsterDirekt = !!cur.direkt;
         });
         await send(`Kontext geleert. Deine nächste Nachricht startet frisch in ${kurz(cur.cwd)} (Modus ${modusName(cur.modus)}).${cur.branch ? `\nDer Branch ${cur.branch} bleibt stehen; die neue Session legt einen eigenen an.` : ""}`);
@@ -969,7 +1243,10 @@ while (true) {
       }
       if (text === "/ende") {
         if (!cur) { await send("Keine aktive Session."); continue; }
-        mutate((r) => { r.sessions = r.sessions.filter((s) => s.id !== cur.id); r.aktiv = null; });
+        mutate((r) => {
+          r.sessions = r.sessions.filter((s) => s.id !== cur.id);
+          r.aktiv = null; if (!r.aktivJe) r.aktivJe = {}; delete r.aktivJe[cur.cwd || DEFAULT_CWD];
+        });
         await send(`Abgelegt: ${cur.titel}. Das Transkript bleibt auf dem Server erhalten.`);
         continue;
       }

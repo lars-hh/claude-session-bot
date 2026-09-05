@@ -31,6 +31,9 @@ Fragestellung. Ein direkter Cherry-Pick ist nicht sinnvoll: die Pfade zeigen auf
 Ausgabe müsste durch unsere Formatierungsschicht. Sinnvoller ist, die Transkript-Leserei **einmal**
 zu bauen und beides daraus zu bedienen.
 
+**Erledigt am 2026-09-05 mit v9** (siehe unten): die Transkript-Schicht steht, `/usage` ist
+nachgebaut statt gepickt, Bauteil 3 und 4 sitzen darauf.
+
 Umgekehrt sind vier Punkte aus diesem Fork **upstream-relevant** und unten je einzeln markiert
 (Punkte 1–4). Sie gehören als schmale Branches von `upstream/main` eingereicht, nicht als dieser
 Fork — der trägt Pfade und Betriebsentscheidungen, die nur hier gelten.
@@ -317,14 +320,108 @@ Adresse. Gemessen: **6 Sekunden** bis zur Adresse, ein zweiter Aufruf liefert di
 Der Aufruf läuft bewusst **ohne `await`** aus der Nachrichtenschleife heraus, damit der Bot während
 des Starts weiter auf Nachrichten hört.
 
-## Was v8 nicht kann (bewusst)
+## v9 (2026-09-05) — Ausbaustufe 3, plus `/usage` aus dem Original
 
-- **Bauteil 3 und 4** (Fortschritt aus dem Transkript, Nebenläufigkeit pro Projekt) — Stufe 3.
-- Bricht eine **neue** Session im Timeout ab, ist ihre Session-ID unbekannt (die liefert `claude -p`
-  erst am Ende). Die Dateien und der Branch sind da, aber `/wechsel` findet die Session nicht. Die
-  Auflösung — neueste `.jsonl` im Projektverzeichnis — gehört zu Bauteil 3 und wartet darauf.
+Bauteil 3 und 4 zusammen, wie im Grill entschieden („zweimal am selben Code schrauben ist
+teurer"). Dazu `/usage` aus Upstream v7 — **nachgebaut, nicht gepickt**: dort zeigen die Pfade auf
+`/root`, und die Ausgabe müsste ohnehin durch unsere Formatierungsschicht. Beide Bauteile und
+`/usage` lesen dieselbe Datei, also gibt es die Leserei genau einmal.
+
+### Die Transkript-Schicht
+
+`~/.claude/projects/<slugifizierter-cwd>/<session-id>.jsonl` wird gelesen und liefert in einem
+Durchlauf beides: die Zahl der Werkzeugaufrufe seit einem Zeitpunkt samt letztem Aufruf
+(Fortschritt) und die Kontextgröße aus der letzten `assistant`-Zeile (`/usage`). Subagenten
+(`isSidechain`) zählen nicht mit, sonst meldet ein Fan-out Schritte, die nicht die Hauptarbeit sind.
+
+Bewusst **gepollt statt `--output-format stream-json`**: der Streaming-Weg baut genau die Teile um,
+die heute tragen — die `is_error`-Prüfung und die Warteschlange. Lesen kostet nichts.
+
+**Die bekannte Kante ist damit geschlossen** (siehe „Was v8 nicht kann" weiter unten, jetzt
+gestrichen): bei einer *neuen* Session steht die ID erst am Ende fest, deshalb nimmt der Bot die
+jüngste `.jsonl` im Projektverzeichnis. Eindeutig ist das nur, solange je Projekt ein Lauf läuft —
+was Bauteil 4 garantiert. Wird dieser Deckel je gelockert, bricht diese Stelle zuerst.
+
+### B3 — Fortschritt
+
+Zwei Wege, derselbe Text:
+
+- **Von selbst.** Dauert ein Auftrag länger als 90 Sekunden, erscheint eine Zeile
+  („`vault läuft seit 5 Min · 12 Schritte · zuletzt Edit auf src/api.ts`") und wird danach jede
+  Minute **editiert**, nicht neu gesendet. Ein Edit löst auf dem Handy keine Benachrichtigung aus,
+  eine neue Nachricht schon — deshalb `editMessageText` und `disable_notification`. Am Ende wird
+  dieselbe Nachricht auf das Ergebnis umgeschrieben („fertig nach 7 Min · 31 Schritte").
+- **Auf Zuruf.** `/fortschritt` zeigt alle laufenden Aufträge mit Projekt, Laufzeit, Schritten und
+  letztem Werkzeugaufruf.
+
+Bei kurzen Aufträgen erscheint gar nichts. Eine Fortschrittsanzeige, die schneller fertig ist als
+der Auftrag, ist nur Lärm.
+
+### B4 — Nebenläufigkeit je Projekt
+
+`busy` und die eine Warteschlange sind weg. Stattdessen eine Reihe **je Projekt**: innerhalb eines
+Projekts weiter streng nacheinander (sonst kollidieren zwei Läufe in denselben Dateien),
+verschiedene Projekte nebeneinander, **Deckel bei 3** wegen 8 GB RAM und weil jeder `--resume` ein
+Vielfaches der Transkriptgröße zieht.
+
+Drei Folgeänderungen, die daran hängen:
+
+1. **Das Ziel-Projekt wird beim Einreihen festgelegt, nicht beim Ausführen.** Sonst läse ein
+   Auftrag, der zehn Minuten in der Reihe stand, am Ende die inzwischen gewechselte aktive Session
+   und liefe im falschen Verzeichnis.
+2. **Die aktive Session wird je Projekt geführt** (`reg.aktivJe`). Ein globaler Zeiger reicht nicht
+   mehr — zwei parallele Läufe würden dieselbe Session greifen und durcheinander resümieren.
+   `reg.aktiv` bleibt daneben bestehen: die Session, die der Nutzer gerade *ansieht*.
+3. **Laufen mehrere Projekte, trägt jede Antwort ihr Projekt im Kopf** (`[vault]`). Ohne das weiß
+   man am Handy nicht, zu welchem Auftrag eine Antwort gehört.
+
+`r.laufend` (Einzelwert) wird zu `r.laufende` (Liste). Beim Start liest der Bot beide Formen und
+schreibt nur die neue — sonst ginge beim ersten Start nach dem Update ein offener Auftrag verloren.
+
+### Der Übergang von v8, der beim Deploy aufgefallen ist
+
+Die Registry auf der Maschine kannte `aktivJe` nicht. Ohne Übernahme hätte der erste Auftrag nach
+dem Update in seinem Projekt keine Session gefunden, eine **neue eröffnet** — und der laufende
+Gesprächsfaden wäre still weg gewesen. Der Bot bindet die vorhandene `aktiv`-Session beim Start an
+ihr Projekt und protokolliert das. Live geprüft:
+`v8-Übergang: aktive Session 03a50368 an /home/claude/work gebunden`.
+
+Das ist die Sorte Fehler, die ein Test auf dem Entwicklungsrechner nicht findet: dort gab es keine
+gewachsene Registry.
+
+### `/usage`
+
+Zeigt Balken, Prozent und absolute Zahlen. Das echte Kontextfenster meldet nur der Lauf selbst
+(`modelUsage[].contextWindow`) und wird an der Session gemerkt. Solange es fehlt, wird geraten —
+200k, bei `[1m]`-Modellen 1 Mio. **Ist die geratene Zahl kleiner als der gemessene Verbrauch, wird
+kein Balken gezeigt**, sondern gesagt, dass das Fenster noch nicht bekannt ist. Eine Schätzung, die
+kleiner ist als die Messung, ist keine Schätzung mehr, sondern falsch — und 100 % anzuzeigen, wo
+22 % richtig wären, ist der Fehler, der zum unnötigen `/clear` führt.
+
+### Geprüft, bevor es deployt wurde
+
+Testkopie der Datei, Telegram-Schleife abgeschnitten, Funktionen exportiert, gegen **echte
+Transkripte** laufen lassen (`scripts`-Variante im Scratchpad, nicht im Repo). 45 Prüfungen:
+Schrittzählung gegen Handzählung derselben Datei, Zeitfenster, Dateisuche mit und ohne
+Session-ID, serielle Reihenfolge im selben Projekt, echte Parallelität über Projekte hinweg, der
+Deckel per Sweep-Line über Start- und Endezeiten, ein Fehlschlag, der die Reihe nicht blockiert,
+und die Taktung des Melders in Echtzeit mit verkürzten Intervallen.
+
+Zwei echte Fehler kamen dabei heraus, beide vor dem Deploy behoben: das Fortschritts-Intervall lief
+mit 150 s statt 60 s (Timeout und Interval standen nebeneinander statt ineinander), und die
+Raterei des Kontextfensters ignorierte die `[1m]`-Modelle. Dazu zwei Fehler im Testgerüst selbst —
+der auffälligere: „wie viele überlappen mit x" ist nicht „wie viele liefen gleichzeitig", und die
+naive Variante meldete fälschlich einen Deckelbruch.
+
+Nach dem Deploy wurde die Schicht **auf der Maschine** gegen deren eigene Transkripte geprüft; die
+Pfad-Slugifizierung ist genau das, was ein Test auf dem Mac nicht abdecken kann.
+
+## Was v9 nicht kann (bewusst)
+
 - Der Vault-Klon hängt an einem read-only Deploy-Key. Ein Push dorthin scheitert und wird ehrlich
   gemeldet; er wird nicht heimlich auf HTTPS umgebogen.
+- **Die Außenwache ist weiterhin unscharf**, solange `HC_URL` fehlt (siehe B7). Das ist der einzige
+  offene Punkt aus Stufe 2 und rangiert vor allem Weiteren.
 
 ## Selbsttest
 

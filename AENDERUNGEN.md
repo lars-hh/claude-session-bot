@@ -423,6 +423,138 @@ Pfad-Slugifizierung ist genau das, was ein Test auf dem Mac nicht abdecken kann.
 - **Die Außenwache ist weiterhin unscharf**, solange `HC_URL` fehlt (siehe B7). Das ist der einzige
   offene Punkt aus Stufe 2 und rangiert vor allem Weiteren.
 
+## v10 (2026-09-05) — Verbrauch sichtbar machen, plus ein Fehler aus v9
+
+Der Bot warf bis hierher alles weg, was ein Lauf über seinen eigenen Verbrauch meldete. Jedes
+Ergebnis-JSON von `claude -p` enthält `total_cost_usd`, ein `usage` mit Cache-Aufschlüsselung und
+`modelUsage` je Modell; gelesen wurden davon drei Felder. Anlass war eine Messung, die etwas
+Unerwartetes zeigte.
+
+### Die Messung
+
+Über alle 69 Transkripte auf der Maschine, Stand 2026-09-05 nach dem Deploy:
+
+| Herkunft | Dateien | Token | API-Calls |
+|---|---:|---:|---:|
+| **Fähigkeits-Ping** („Antworte nur mit OK") | 53 | **1.414.140** | 58 |
+| Bot-Aufträge | 11 | 1.007.379 | 30 |
+| Sonstiges (`/rc`, SSH-Läufe, Testverzeichnisse) | 5 | 134.624 | 6 |
+| | **69** | **2.556.143** | **94** |
+
+**Die Wache verbraucht mehr als alles andere zusammen — 55 % des Gesamtverbrauchs.** Ein einzelner
+Ping kostet rund 26.700 Token für eine Antwort aus zwei Buchstaben.
+
+Gegengeprüft, woran das liegt, und es liegt **nicht** an der Konfiguration: für User `claude` ist
+kein MCP-Server eingerichtet, es gibt keine eigenen Skills, Commands, Agents oder Hooks, und die
+globale `CLAUDE.md` ist knapp 2.400 Token groß. Der Rest ist Claude Codes eigener Systemprompt samt
+Werkzeug-Definitionen — der Boden jedes `claude -p`-Aufrufs. **An der Größe eines Pings ist nichts zu
+holen, nur an der Häufigkeit.**
+
+### Die Falle beim Zählen: eine API-Antwort sind mehrere Zeilen
+
+Beim Bauen kam heraus, dass die naheliegende Auswertung falsch rechnet, und zwar um Faktor zwei.
+
+Claude Code schreibt **eine** API-Antwort als **eine JSONL-Zeile je Content-Block** — `thinking`,
+`text`, jedes einzelne `tool_use` — und legt in **jede** dieser Zeilen das **volle, identische**
+`usage`-Objekt. Wer über alle `assistant`-Zeilen summiert, zählt jeden Aufruf so oft, wie er Blöcke
+hatte. Ein Ping-Transkript zeigt es im Kleinen: zwei Zeilen (`thinking` + `text`), gleiche
+`message.id`, gleiche `requestId`, beide mit 27.268 Token. Verbraucht wurden 27.268, nicht 54.536.
+
+Gemessen über den gesamten Bestand: **naiv 5.137.873 gegen dediziert gezählt 2.556.143, Faktor 2,01**
+(je Topf 1,43 bis 2,14 — ein Ping hat zwei Blöcke, ein echter Auftrag oft vier). Der Leser
+dedupliziert deshalb je Datei über `message.id` + `requestId`, dieselbe Regel wie `ccusage`. Fehlt
+eines der beiden Felder, wird auf die Zeilen-`uuid` ausgewichen: lieber einmal zu viel gezählt als
+eine Messung still verschwinden lassen.
+
+**Der Kommentar an dieser Stelle im Code nennt die Messung ausdrücklich.** Wer sie nicht kennt, hält
+die Deduplizierung für überflüssigen Aufwand und verdoppelt beim Aufräumen still jede Zahl in
+`/usage`.
+
+Die Verhältnisse zwischen den Töpfen ändert das kaum — die Aussage „die Wache frisst mehr als die
+Arbeit" hält in beiden Zählweisen. Die absoluten Zahlen ändert es um die Hälfte.
+
+### Der Fehler aus v9, der mitbehoben ist
+
+`capabilityPing()` startete Claude mit `cwd: DEFAULT_CWD` und legte seine Transkripte damit in
+**dasselbe** Projektverzeichnis wie die echten Aufträge. Genau dort greift die Fallback-Regel aus v9:
+bei einer neuen Session steht die Session-ID erst am Ende fest, also nimmt `juengstesTranskript()`
+die jüngste `.jsonl` im Verzeichnis. Fiel ein Ping in einen laufenden Auftrag — und er fiel alle
+30 Minuten irgendwohin —, war **seine** Datei die jüngste, und die Fortschrittsanzeige meldete für
+den laufenden Auftrag „noch kein Schritt im Protokoll".
+
+Oben in diesem Dokument steht zu dieser Stelle, sie „bricht bei einer Lockerung zuerst". Sie brach
+schon ohne Lockerung, an etwas, das von selbst passierte. Die Wache hat jetzt mit `WACHE_CWD`
+(`/home/claude/.wache`) ihr eigenes Arbeitsverzeichnis. Die alten Ping-Transkripte bleiben liegen,
+wo sie sind — sie sind die Datengrundlage für den Rückblick und werden über die erste Nutzerzeile
+weiterhin korrekt als Wache erkannt.
+
+### Die Wache pingt nur noch im Leerlauf
+
+Ein durchgelaufener Auftrag beweist die Fähigkeit besser als ein „OK": er hat dieselbe Kette benutzt
+und dabei etwas Nützliches getan. Lief in den letzten `HC_INTERVAL` ein Auftrag **erfolgreich**
+durch, unterbleibt der Ping.
+
+Zwei Feinheiten, die leicht falsch gebaut werden:
+
+- **Nur ein erfolgreicher Lauf zählt.** Ein fehlgeschlagener ist ausdrücklich kein Nachweis — sonst
+  besänftigt ausgerechnet ein Auth-Ausfall die Wache, und genau den soll sie finden.
+- **Beim Überspringen wird trotzdem gepingt** (`hcPing("")`). Ohne das bedeutet „übersprungen" für
+  healthchecks.io dasselbe wie „ausgefallen", und die Wache schlägt falschen Alarm.
+
+Nach einem Neustart ist der Nachweis leer, der erste Ping läuft also normal. Im Zweifel prüfen.
+
+### `/usage` hat jetzt zwei Teile
+
+Teil eins ist unverändert der Kontextstand der angesehenen Session. Teil zwei zeigt den Verbrauch
+der **ganzen Maschine** — heute, gestern, sieben Tage — und darunter die Aufteilung nach Herkunft.
+Das ist der eigentliche Ertrag: eine sessionbezogene Anzeige hätte genau die Posten nie gezeigt, die
+überrascht haben. Ohne aktive Session sagt Teil eins das und Teil zwei läuft trotzdem.
+
+Dazu ein kleiner Schreibpfad, ohne den der Kostenteil unbaubar wäre: die Transkripte enthalten **kein
+einziges Kostenfeld** (0 Zeilen mit `costUSD` oder `total_cost_usd`, geprüft). Der Betrag steht nur
+im Ergebnis-JSON, und das wurde bisher weggeworfen. `runClaude()` gibt ihn jetzt zurück,
+`auftragAusfuehren()` schreibt ihn als Tagessumme in die Registry (30 Tage Vorhalt). `/usage` weist
+ihn als **API-Äquivalent** aus, nie als „Kosten", und **nur für Bot-Aufträge** — für Wache und `/rc`
+gibt es keinen Wert, und es wird auch keiner geschätzt. Sonst liest sich eine Tagessumme wie eine
+Abbuchung.
+
+**Fail-loud statt Null:** ist das Projektverzeichnis nicht lesbar oder liegt im Fenster keine Datei,
+sagt `/usage` das ausdrücklich und zeigt keine Null, die wie eine Messung aussieht. Dieselbe Regel,
+an der die `cal snapshot`-Havarie im Juli gescheitert ist — ein `event_count: 0` war dort praktisch
+immer ein Backend-Defekt, nie ein leerer Kalender.
+
+### Geprüft, bevor es deployt wurde
+
+Wie bei v9: Testkopie der Datei, Telegram-Schleife abgeschnitten, `HOME` umgebogen, Timer entschärft,
+`tg()` gestubbt. **34 Prüfungen, alle grün**, gegen echte von der Maschine kopierte Transkripte plus
+vier künstliche Kontrollen. Drei davon tragen die Last:
+
+- **Positivkontrolle:** ein von Hand gebautes Transkript, eine `message.id` über drei Blöcke, `usage`
+  je 100 Token. Erwartung 100, naiv käme 300 heraus.
+- **Mutationsprobe:** dieselbe Prüfung noch einmal gegen eine Fassung, in der die Deduplizierung
+  absichtlich ausgebaut ist. Sie meldet dort 300. Erst damit ist gezeigt, dass die Prüfung überhaupt
+  rot werden **kann** — ein grüner Test allein beweist nichts.
+- **Unabhängige Handzählung:** ein getrennt geschriebenes Python-Skript ermittelt dieselben Tages-
+  und Herkunftssummen. Bewusst eine andere Sprache, damit ein Denkfehler nicht mitkopiert wird.
+
+Nach dem Deploy noch einmal **auf der Maschine** gegen deren eigene 68 Transkripte: Leser und
+Handzählung stimmen auf die Stelle überein (`{wache: 1.386.818, auftrag: 1.007.379, sonstiges:
+134.624}`), Laufzeit 66 ms. Die Pfad-Slugifizierung ist genau das, was ein Mac-Test nicht abdeckt —
+`/home/claude/.wache` wird zu `-home-claude--wache` und kollidiert nicht mit `-home-claude-work`.
+Verifiziert ist außerdem, dass die beiden Pings nach dem Neustart im neuen Verzeichnis landen,
+während die jüngste Datei im Auftrags-Verzeichnis von vor dem Deploy stammt.
+
+### Was v10 nicht kann (bewusst)
+
+- **Die Außenwache ist weiterhin unscharf**, solange `HC_URL` fehlt. Damit ist auch der
+  `hcPing("")` beim Überspringen ein No-op — die Leerlauf-Logik ist mit Stub nachgewiesen, aber
+  bis zur Außenwelt nicht verifiziert. Das bleibt der erste offene Punkt.
+- **Kein Plan-Fenster.** Wie viel vom Max-Plan verbraucht ist, lässt sich auf einer Maschine nicht
+  ehrlich beantworten — der Arbeits-Mac fehlt in der Rechnung, die Zahl wäre systematisch zu
+  niedrig. Lieber keine Zahl als eine falsche.
+- **Keine Preistabelle.** Die Einheit ist Token. Eine selbst gepflegte Preistabelle rottet still,
+  und ein falscher Preis ist schlechter als keiner.
+
 ## Selbsttest
 
 Die Maschinerie wurde am 2026-09-05 gegen echte Repos, echtes `gh` und echtes `git` auf LXC 112

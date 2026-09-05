@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Session-Bot v9 (LXC 112) — steuert Claude-Code-Sessions per Telegram.
+// Session-Bot v10 (LXC 112) — steuert Claude-Code-Sessions per Telegram.
 // Abgeleitet von AlphaGenX/claude-telegram-session-bot v6.1 (MIT), mit sechs Korrekturen:
 //   1. MODI.standard: "default" existiert nicht mehr -> "manual"
 //   2. CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT statt MCP_TOOL_TIMEOUT (der echte Killer)
@@ -19,6 +19,14 @@
 //      plus /fortschritt auf Zuruf. Eine Transkript-Schicht bedient beides und /usage.
 //   B4 Nebenläufigkeit je Projekt: gleiches Projekt weiter seriell, verschiedene parallel,
 //      Deckel bei 3. Die aktive Session wird dafür je Projekt geführt (reg.aktivJe).
+// v10 (2026-09-05) — Verbrauch sichtbar machen, plus ein Fehler-Fix aus v9:
+//   Die Wache bekommt ein eigenes Arbeitsverzeichnis (WACHE_CWD). Vorher schrieb sie ihr
+//      Transkript neben die Aufträge und kaperte damit die Fortschrittsanzeige.
+//   Die Wache pingt nur noch im Leerlauf — ein durchgelaufener Auftrag ist der bessere
+//      Nachweis. Gemessen kostete sie mehr Token als die eigentliche Arbeit.
+//   /usage zeigt zusätzlich den Verbrauch der ganzen Maschine, nach Herkunft getrennt.
+//      Der Leser dedupliziert dabei über message.id + requestId — ohne das zählt man
+//      jeden API-Aufruf so oft, wie er Content-Blöcke hatte (gemessen: Faktor ~2).
 // Befehle: /neu [repo|projekt|/pfad] [Auftrag], /projekte [add|scan], /direkt, /compact,
 //          /modus, /modell, /sessions, /wechsel N, /status, /usage, /fortschritt, /clear, /ende
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
@@ -36,6 +44,12 @@ const PROJ = `${HOME}/.config/claude-projekte.json`;
 const REPOS = `${HOME}/.config/claude-repos.json`;
 const PERM_DIR = `${HOME}/.perm`;
 const DEFAULT_CWD = `${HOME}/work`;
+// v10: eigenes Arbeitsverzeichnis für die Wache. Vorher lief der Ping in DEFAULT_CWD und legte
+// sein Transkript neben die echten Aufträge — genau dort greift die Fallback-Regel "nimm die
+// jüngste .jsonl" aus juengstesTranskript(). Fiel ein Ping in einen laufenden Auftrag (alle
+// 30 Min fällt er irgendwohin), las die Fortschrittsanzeige den Ping und meldete "noch kein
+// Schritt im Protokoll". Das war kein Grenzfall, sondern passierte von selbst.
+const WACHE_CWD = `${HOME}/.wache`;
 const DEFAULT_MODE = "bypassPermissions"; // Lars-Entscheidung 2026-09-04, Blast-Radius akzeptiert
 const WORK_ROOT = `${HOME}/work`;         // hier entstehen Projekte; /projekte findet sie selbst
 const CLAUDE = "/usr/bin/claude";
@@ -87,7 +101,9 @@ const modellName = (wert) => (Object.entries(MODELLE).find(([, v]) => v === wert
 // nicht mehr — zwei Läufe in verschiedenen Projekten würden sonst dieselbe Session greifen.
 // reg.aktiv bleibt daneben bestehen: die Session, die der Nutzer gerade ansieht.
 // laufende: Array statt Einzelwert (laufend), damit ein Neustart alle offenen Läufe kennt.
-const LEER = { sessions: [], aktiv: null, aktivJe: {}, naechstesCwd: null, naechsterModus: null, naechstesModell: null, naechsterDirekt: false, warteschlange: [], laufende: [], laufend: null };
+// kostenJeTag: "YYYY-MM-DD" -> USD. Nur Bot-Aufträge, denn nur die liefern ein Ergebnis-JSON
+// mit total_cost_usd. Für Wache und /rc gibt es keinen Wert — und es wird auch keiner geschätzt.
+const LEER = { sessions: [], aktiv: null, aktivJe: {}, naechstesCwd: null, naechsterModus: null, naechstesModell: null, naechsterDirekt: false, warteschlange: [], laufende: [], laufend: null, kostenJeTag: {} };
 const load = () => { try { return { ...LEER, ...JSON.parse(readFileSync(REG, "utf8")) }; } catch { return { ...LEER }; } };
 const save = (r) => writeFileSync(REG, JSON.stringify(r, null, 2), { mode: 0o600 });
 // Immer frisch laden, ändern, schreiben. pump() und die Nachrichtenschleife laufen
@@ -509,7 +525,10 @@ function runClaude(auftrag, resumeId, cwd, modus, modell) {
       // als vermeintliche Claude-Antwort im Chat und der Bot wirkt monatelang gesund.
       if (j.is_error === true) {
         const grund = j.result || j.api_error_status || j.terminal_reason || "unbekannter API-Fehler";
-        return resolve({ ok: false, error: `Claude meldet einen Fehler: ${String(grund).slice(0, 400)}`, sid: j.session_id || resumeId || null });
+        // Auch ein gescheiterter Lauf kostet, wenn er überhaupt bis zur API kam — deshalb
+        // wird der Betrag hier ebenso mitgenommen wie im Erfolgsfall.
+        return resolve({ ok: false, error: `Claude meldet einen Fehler: ${String(grund).slice(0, 400)}`, sid: j.session_id || resumeId || null,
+          kosten: typeof j.total_cost_usd === "number" ? j.total_cost_usd : null });
       }
       // Das echte Kontextfenster meldet nur der Lauf selbst. Wir merken es uns am
       // Haupt-Modell (der modelUsage-Eintrag mit den meisten Input-Token) — sonst
@@ -519,7 +538,11 @@ function runClaude(auftrag, resumeId, cwd, modus, modell) {
         const inp = (mu.inputTokens || 0) + (mu.cacheReadInputTokens || 0) + (mu.cacheCreationInputTokens || 0);
         if (mu.contextWindow && inp > meiste) { meiste = inp; fenster = mu.contextWindow; }
       }
-      resolve({ ok: true, result: j.result || "(kein Ergebnis)", sid: j.session_id || resumeId || null, fenster });
+      // v10: total_cost_usd steht direkt neben dem modelUsage oben und wurde bisher weggeworfen.
+      // Die Transkripte kennen die Kosten NICHT (kein einziges Kostenfeld darin, geprüft) —
+      // wer sie in /usage zeigen will, muss sie hier aufheben.
+      resolve({ ok: true, result: j.result || "(kein Ergebnis)", sid: j.session_id || resumeId || null, fenster,
+        kosten: typeof j.total_cost_usd === "number" ? j.total_cost_usd : null });
     });
     kind.stdin.end(); // sonst wartet Claude 3 Sekunden auf stdin
   });
@@ -612,6 +635,132 @@ function transkriptLesen(pfad, seit) {
     }
   }
   return { schritte, zuletzt, letzteZeit, kontext, modell };
+}
+
+// ---------------------------------------------------------------------------
+// v10: derselbe Dateibestand wie oben, andere Frage — was hat diese Maschine verbraucht?
+//
+// Hier steckt die Falle, an der eine naive Auswertung scheitert: Claude Code schreibt EINE
+// API-Antwort als EINE Zeile JE CONTENT-BLOCK (thinking, text, jedes tool_use) und legt in
+// JEDE dieser Zeilen das VOLLE, identische usage-Objekt. Wer über alle assistant-Zeilen
+// summiert, zählt jeden Aufruf so oft, wie er Blöcke hatte. Gemessen am 2026-09-05 über alle
+// 66 Transkripte dieser Maschine: Faktor 1,97 bis 2,09 — also grob doppelt.
+//
+// Ein Ping-Transkript zeigt es im Kleinen: zwei Zeilen (thinking + text), gleiche message.id,
+// gleiche requestId, beide mit 27.268 Token. Verbraucht wurden 27.268, nicht 54.536.
+//
+// Deshalb wird je Datei über message.id + requestId dedupliziert — dieselbe Regel wie ccusage.
+// Wer das hier "vereinfacht", verdoppelt still jede Zahl in /usage.
+// ---------------------------------------------------------------------------
+const TAG_VON = (ts) => new Date(ts).toLocaleDateString("sv-SE", { timeZone: "Europe/Berlin" }); // YYYY-MM-DD
+const leerTag = () => ({ input: 0, output: 0, cacheCreate: 0, cacheRead: 0, gesamt: 0, calls: 0 });
+
+// Wessen Lauf war das? Der Ping wird am Prompt erkannt und NICHT am Verzeichnis — die alten
+// Ping-Transkripte liegen noch im Auftrags-Verzeichnis, dort wo sie bis v10 hingeschrieben
+// wurden. Erst wenn der Prompt nichts sagt, entscheidet das Verzeichnis.
+function herkunftVon(z, dirName, auftragsDirs) {
+  const ausDir = () => (auftragsDirs.has(dirName) ? "auftrag" : "sonstiges");
+  for (const roh of z) {
+    let j;
+    try { j = JSON.parse(roh); } catch { continue; }
+    if (j.type !== "user") continue;
+    const c = (j.message || {}).content;
+    const txt = typeof c === "string" ? c : JSON.stringify(c || "");
+    return txt.includes("Antworte nur mit OK") ? "wache" : ausDir();
+  }
+  return ausDir();
+}
+
+function verbrauchLesen(vonMs, bisMs) {
+  const wurzel = `${HOME}/.claude/projects`;
+  const tage = {}, herkunft = { wache: 0, auftrag: 0, sonstiges: 0 };
+  let dateien = 0, gelesen = 0;
+  let dirs;
+  try { dirs = readdirSync(wurzel); }
+  catch (e) { return { tage, herkunft, dateien: 0, gelesen: 0, fehler: `${wurzel} nicht lesbar (${(e && e.code) || e})` }; }
+  // Welche Verzeichnisse gehören zu Bot-Aufträgen? Über projektDir() ableiten, nicht am
+  // Dateinamen raten — die Slugifizierung stammt von Claude Code, nicht von uns.
+  const auftragsDirs = new Set([...Object.values(loadProj()), DEFAULT_CWD].map((p) => projektDir(p).split("/").pop()));
+  for (const dirName of dirs) {
+    let namen;
+    try { namen = readdirSync(`${wurzel}/${dirName}`); } catch { continue; }
+    for (const name of namen) {
+      if (!name.endsWith(".jsonl")) continue;
+      const p = `${wurzel}/${dirName}/${name}`;
+      // Eine Datei, deren letzte Schreibzeit vor dem Fenster liegt, kann keine Zeile darin
+      // haben. Ohne diesen Sprung wächst jeder /usage-Aufruf mit dem Archiv mit.
+      try { if (statSync(p).mtimeMs < vonMs) continue; } catch { continue; }
+      dateien++;
+      const z = zeilen(p);
+      if (!z) continue;
+      gelesen++;
+      const herk = herkunftVon(z, dirName, auftragsDirs);
+      const gesehen = new Set();
+      for (const roh of z) {
+        let j;
+        try { j = JSON.parse(roh); } catch { continue; }
+        if (j.type !== "assistant" || j.isSidechain) continue;
+        const m = j.message || {}, u = m.usage;
+        if (!u) continue;
+        const ts = j.timestamp ? Date.parse(j.timestamp) : NaN;
+        if (!ts || ts < vonMs || ts > bisMs) continue;
+        // Fehlt eines der beiden Dedup-Felder, ist die Zeilen-uuid der Ausweg: sie ist je
+        // Zeile eindeutig, die Zeile wird also gezählt statt fälschlich mit einer anderen
+        // zusammengefasst. Lieber einmal zu viel als eine still verschwundene Messung.
+        const k = m.id && j.requestId ? `${m.id}:${j.requestId}` : `uuid:${j.uuid || name + gesehen.size}`;
+        if (gesehen.has(k)) continue;
+        gesehen.add(k);
+        const tagName = TAG_VON(ts);
+        const tag = tage[tagName] || (tage[tagName] = leerTag());
+        const inp = u.input_tokens || 0, outp = u.output_tokens || 0;
+        const cc = u.cache_creation_input_tokens || 0, cr = u.cache_read_input_tokens || 0;
+        tag.input += inp; tag.output += outp; tag.cacheCreate += cc; tag.cacheRead += cr;
+        tag.gesamt += inp + outp + cc + cr; tag.calls++;
+        herkunft[herk] += inp + outp + cc + cr;
+      }
+    }
+  }
+  return { tage, herkunft, dateien, gelesen, fehler: null };
+}
+
+// Am Handy liest sich "3.282.194" nicht. Ab zehntausend wird gerundet.
+const tokKurz = (n) => {
+  const x = Number(n) || 0;
+  if (x >= 1000000) return `${(x / 1000000).toLocaleString("de-DE", { maximumFractionDigits: 2 })} Mio`;
+  if (x >= 10000) return `${Math.round(x / 1000)}k`;
+  return tsd(x);
+};
+const dollar = (n) => `$${(Number(n) || 0).toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+// Teil 2 von /usage: was die MASCHINE verbraucht — nicht nur diese Session und nicht nur die
+// Bot-Aufträge. Genau die Posten, die überrascht haben (die Wache), tauchen in einer
+// sessionbezogenen Anzeige nie auf.
+function verbrauchsBericht() {
+  const jetzt = Date.now(), von = jetzt - 7 * 86400000;
+  const v = verbrauchLesen(von, jetzt);
+  // Fail-loud: eine Null, die wie eine Messung aussieht, ist schlimmer als keine Zahl.
+  // Dieselbe Lehre wie aus der cal-snapshot-Havarie im Juli — 0 war dort nie ein leerer Kalender.
+  if (v.fehler) return `Maschinen-Verbrauch nicht lesbar: ${v.fehler}.\nDas ist keine Null, sondern ein Defekt.`;
+  if (!v.dateien) return `Maschinen-Verbrauch nicht lesbar: im 7-Tage-Fenster liegt unter ${HOME}/.claude/projects keine einzige Transkript-Datei.\nDas ist keine Null, sondern ein Defekt.`;
+  const heute = TAG_VON(jetzt), gestern = TAG_VON(jetzt - 86400000);
+  const amTag = (t) => (v.tage[t] ? v.tage[t].gesamt : 0);
+  const woche = Object.values(v.tage).reduce((n, t) => n + t.gesamt, 0);
+  const h = v.herkunft;
+  const raus = [
+    "Verbrauch auf dieser Maschine (alle Läufe, nicht nur Bot-Aufträge):",
+    `heute ${tokKurz(amTag(heute))} · gestern ${tokKurz(amTag(gestern))} · 7 Tage ${tokKurz(woche)} Token`,
+    `davon 7 Tage: Wache ${tokKurz(h.wache)} · Aufträge ${tokKurz(h.auftrag)} · Sonstiges ${tokKurz(h.sonstiges)}`,
+  ];
+  if (h.wache > h.auftrag + h.sonstiges) raus.push("Die Wache verbraucht mehr als Aufträge und Sonstiges zusammen.");
+  // Die exakten Kosten stehen NICHT im Transkript (dort gibt es kein einziges Kostenfeld),
+  // sondern nur im Ergebnis-JSON eines Bot-Auftrags. Deshalb gibt es sie ausschließlich für
+  // Aufträge — für Wache und /rc wird bewusst nichts geschätzt.
+  const kjt = load().kostenJeTag || {};
+  const abTag = TAG_VON(von);
+  const kWoche = Object.entries(kjt).reduce((n, [t, w]) => (t >= abTag ? n + (Number(w) || 0) : n), 0);
+  if (kWoche > 0) raus.push(`API-Äquivalent der Bot-Aufträge: heute ${dollar(kjt[heute] || 0)} · 7 Tage ${dollar(kWoche)}`
+    + " — Vergleichsmaß, keine Abbuchung; für Wache und /rc gibt es keinen Wert.");
+  return raus.join("\n");
 }
 
 const dauerText = (ms) => {
@@ -737,6 +886,11 @@ async function auftragAusfuehren(item) {
   try { r = await runClaude(prompt, cur ? cur.id : null, cwd, modus, modell); }
   catch (e) { await melder.ende("fehlgeschlagen"); throw e; }
 
+  // v10: nur ein ERFOLGREICHER Lauf ist ein Fähigkeitsnachweis und erspart der Wache den Ping.
+  // Ein fehlgeschlagener zählt ausdrücklich nicht — sonst besänftigt ausgerechnet ein
+  // Auth-Ausfall die Wache, und genau den soll sie finden.
+  if (r.ok) letzterNachweis = Date.now();
+
   // Session festhalten — auch wenn der Lauf schiefging, solange eine ID bekannt ist.
   const sid = r.sid || (cur ? cur.id : null);
   mutate((reg2) => {
@@ -758,6 +912,18 @@ async function auftragAusfuehren(item) {
       // Die "nächste Session"-Vorgaben gelten nur für das Projekt, das sie eröffnet hat.
       if (reg2.naechstesCwd === cwd || !reg2.naechstesCwd) reg2.naechstesCwd = null;
       reg2.naechsterModus = null; reg2.naechstesModell = null; reg2.naechsterDirekt = false;
+    }
+    // v10: die Kosten fortschreiben — nach dem if/else, damit beide Zweige (bestehende und
+    // neu angelegte Session) getroffen werden. Nur so kann /usage sie überhaupt zeigen.
+    if (typeof r.kosten === "number") {
+      if (!reg2.kostenJeTag) reg2.kostenJeTag = {};
+      const tag = TAG_VON(Date.now());
+      reg2.kostenJeTag[tag] = (reg2.kostenJeTag[tag] || 0) + r.kosten;
+      // 30 Tage reichen für /usage; sonst wächst die Registry unbegrenzt.
+      const grenze = TAG_VON(Date.now() - 30 * 86400000);
+      for (const k of Object.keys(reg2.kostenJeTag)) if (k < grenze) delete reg2.kostenJeTag[k];
+      const sk = reg2.sessions.find((x) => x.id === (sid || (cur && cur.id)));
+      if (sk) sk.kosten = (sk.kosten || 0) + r.kosten;
     }
   });
 
@@ -788,6 +954,17 @@ async function auftragAusfuehren(item) {
 // ---------------------------------------------------------------------------
 const hc = { letzterOk: null, letzterVersuch: null, letzterFehler: null, unscharfGemeldet: false };
 
+// v10: die Wache bekommt ihr eigenes Verzeichnis, damit ihre Transkripte nicht mehr zwischen
+// denen der Aufträge liegen (siehe WACHE_CWD oben). Einmal beim Start anlegen.
+try { mkdirSync(WACHE_CWD, { recursive: true, mode: 0o700 }); }
+catch (e) { fehler("WACHE_CWD:", (e && e.message) || e); }
+
+// v10: ein durchgelaufener Auftrag ist der bessere Fähigkeitsnachweis als ein "OK" —
+// er hat dieselbe Kette benutzt und dabei etwas Nützliches getan. Der Ping ist nur nötig,
+// wenn nichts lief. Bei einem Neustart ist der Wert leer, der erste Ping läuft also normal:
+// im Zweifel prüfen.
+let letzterNachweis = null;
+
 async function hcPing(pfad) {
   if (!HC_URL) return;
   try { await fetch(HC_URL + (pfad || ""), { method: "GET", signal: AbortSignal.timeout(15000) }); }
@@ -800,9 +977,20 @@ async function capabilityPing() {
     fehler("Capability-Ping UNSCHARF: HC_URL ist nicht gesetzt. Ein Ausfall des Bots wird nicht extern gemeldet.");
     hc.unscharfGemeldet = true;
   }
+  // v10: lief in diesem Intervall ein Auftrag durch, ist die Fähigkeit bereits bewiesen —
+  // dann kein zweiter Claude-Aufruf. Gemessen kostet ein Ping ~27k Token für zwei Buchstaben,
+  // und über einen Tag summiert sich das auf mehr als die eigentliche Arbeit.
+  // Der hcPing hier ist Pflicht: ohne ihn liest healthchecks.io "übersprungen" als "ausgefallen".
+  if (letzterNachweis && Date.now() - letzterNachweis < HC_INTERVAL) {
+    hc.letzterOk = letzterNachweis;
+    hc.letzterFehler = null;
+    await hcPing("");
+    log(`Capability-Ping übersprungen: Auftrag um ${wann(letzterNachweis)} war der Nachweis`);
+    return;
+  }
   const r = await new Promise((resolve) => {
     execFile(CLAUDE, ["-p", "Antworte nur mit OK.", "--output-format", "json", "--model", MODELLE.haiku, "--permission-mode", "plan"],
-      { cwd: DEFAULT_CWD, env: ENV, timeout: 180000, maxBuffer: 4 * 1024 * 1024 }, (e, out) => {
+      { cwd: WACHE_CWD, env: ENV, timeout: 180000, maxBuffer: 4 * 1024 * 1024 }, (e, out) => {
         if (e && !out) return resolve({ ok: false, grund: String((e && e.message) || e).slice(0, 200) });
         try {
           const j = JSON.parse(out);
@@ -914,7 +1102,7 @@ const BEFEHLE = [
   { command: "rc", description: "Remote-Control-Sitzung öffnen: volle Oberfläche im Browser" },
   { command: "status", description: "Stand, Verzeichnis, Branch, PR, Außenwache" },
   { command: "fortschritt", description: "Was die laufenden Aufträge gerade tun" },
-  { command: "usage", description: "Kontextverbrauch der aktiven Session" },
+  { command: "usage", description: "Kontext der Session plus Token-Verbrauch der Maschine" },
   { command: "sessions", description: "Alle Sessions mit Projekt und Branch" },
   { command: "wechsel", description: "Session wechseln (/wechsel 2)" },
   { command: "direkt", description: "Direkt auf dem Hauptbranch statt Branch + PR" },
@@ -928,7 +1116,7 @@ const BEFEHLE = [
 ];
 
 let offset = 0;
-log(`Session-Bot v9 gestartet (LXC 112, User claude). Deckel ${DECKEL} Läufe. Capability-Ping: ${HC_URL ? "scharf" : "UNSCHARF (HC_URL fehlt)"}`);
+log(`Session-Bot v10 gestartet (LXC 112, User claude). Deckel ${DECKEL} Läufe. Capability-Ping: ${HC_URL ? "scharf" : "UNSCHARF (HC_URL fehlt)"}, Wache in ${WACHE_CWD}`);
 const menue = await tg("setMyCommands", { commands: BEFEHLE });
 if (!menue?.ok) fehler("Befehlsmenü konnte nicht gesetzt werden:", (menue && menue.description) || "");
 
@@ -957,7 +1145,7 @@ const HILFE = "Session-Bot bereit (LXC 112). Jede Nachricht ist ein Auftrag an d
   + "/wechsel N - Session wechseln\n"
   + "/status - Stand plus SSH-Befehl zum Fortsetzen\n"
   + "/fortschritt - was die laufenden Aufträge gerade tun\n"
-  + "/usage - Kontextverbrauch der aktiven Session\n"
+  + "/usage - Kontext der aktiven Session plus Token-Verbrauch der Maschine\n"
   + "/clear - Kontext leeren\n"
   + "/ende - aktive Session ablegen\n\n"
   + `Verschiedene Projekte laufen nebeneinander (höchstens ${DECKEL} gleichzeitig), innerhalb eines Projekts nacheinander. `
@@ -1084,26 +1272,39 @@ while (true) {
       // /usage — Kontextverbrauch der angesehenen Session. Nachgebaut aus Upstream v7
       // (f9f7721), nicht gepickt: dort zeigen die Pfade auf /root, und die Ausgabe muss
       // durch unsere Formatierungsschicht. Das Lesen selbst macht die Transkript-Schicht.
+      // v10: /usage hat jetzt zwei Teile. Teil 1 ist der Kontextstand der angesehenen Session
+      // (unverändert), Teil 2 der Verbrauch der ganzen Maschine. Teil 1 wird deshalb in eine
+      // Variable gebaut statt sofort gesendet — Teil 2 hängt daran und geht in einer Nachricht
+      // raus. Ohne aktive Session sagt Teil 1 das und Teil 2 läuft trotzdem: der
+      // Maschinenverbrauch hängt an keiner Session.
       if (text === "/usage") {
-        if (!cur) { await send("Keine aktive Session. Schick einen Auftrag oder /neu."); continue; }
-        const pfad = transkriptFinden(cur.cwd || DEFAULT_CWD, cur.id, null);
-        const t = pfad ? transkriptLesen(pfad, null) : null;
-        if (!t || !t.kontext) { await send(`Zur Session "${cur.titel}" liegt noch kein Transkript mit Verbrauch vor — vermutlich lief noch kein Auftrag durch.`); continue; }
-        const fenster = cur.fenster || fensterRaten(t.modell);
-        // Eine geratene Zahl, die kleiner ist als der gemessene Verbrauch, ist keine
-        // Schätzung mehr, sondern falsch. Dann lieber nur den Verbrauch zeigen.
-        if (!cur.fenster && t.kontext > fenster) {
-          await send(`Kontext der Session "${cur.titel}" [${kurz(cur.cwd)}]: ${tsd(t.kontext)} Token.\n`
-            + `Das Kontextfenster dieser Session ist noch nicht bekannt — der nächste Auftrag meldet es, danach zeigt /usage auch den Anteil.\n`
-            + `Modell: ${t.modell || modellName(cur.modell)}`);
-          continue;
+        let teil1;
+        if (!cur) {
+          teil1 = "Keine aktive Session — der Kontextstand fehlt deshalb. Schick einen Auftrag oder /neu.";
+        } else {
+          const pfad = transkriptFinden(cur.cwd || DEFAULT_CWD, cur.id, null);
+          const t = pfad ? transkriptLesen(pfad, null) : null;
+          if (!t || !t.kontext) {
+            teil1 = `Zur Session "${cur.titel}" liegt noch kein Transkript mit Verbrauch vor — vermutlich lief noch kein Auftrag durch.`;
+          } else {
+            const fenster = cur.fenster || fensterRaten(t.modell);
+            // Eine geratene Zahl, die kleiner ist als der gemessene Verbrauch, ist keine
+            // Schätzung mehr, sondern falsch. Dann lieber nur den Verbrauch zeigen.
+            if (!cur.fenster && t.kontext > fenster) {
+              teil1 = `Kontext der Session "${cur.titel}" [${kurz(cur.cwd)}]: ${tsd(t.kontext)} Token.\n`
+                + `Das Kontextfenster dieser Session ist noch nicht bekannt — der nächste Auftrag meldet es, danach zeigt /usage auch den Anteil.\n`
+                + `Modell: ${t.modell || modellName(cur.modell)}`;
+            } else {
+              const prozent = Math.min(100, Math.round((t.kontext / fenster) * 100));
+              const balken = "█".repeat(Math.round(prozent / 5)).padEnd(20, "░");
+              teil1 = `Kontext der Session "${cur.titel}" [${kurz(cur.cwd)}]:\n\`${balken}\` ${prozent} %\n`
+                + `${tsd(t.kontext)} von ${tsd(fenster)} Token${cur.fenster ? "" : " (Fenster geschätzt, nach dem nächsten Auftrag exakt)"}\n`
+                + `Modell: ${t.modell || modellName(cur.modell)}`
+                + (prozent >= 70 ? "\n\nWird es eng: /compact verdichtet, /clear leert. Das Verzeichnis bleibt in beiden Fällen." : "");
+            }
+          }
         }
-        const prozent = Math.min(100, Math.round((t.kontext / fenster) * 100));
-        const balken = "█".repeat(Math.round(prozent / 5)).padEnd(20, "░");
-        await send(`Kontext der Session "${cur.titel}" [${kurz(cur.cwd)}]:\n\`${balken}\` ${prozent} %\n`
-          + `${tsd(t.kontext)} von ${tsd(fenster)} Token${cur.fenster ? "" : " (Fenster geschätzt, nach dem nächsten Auftrag exakt)"}\n`
-          + `Modell: ${t.modell || modellName(cur.modell)}`
-          + (prozent >= 70 ? "\n\nWird es eng: /compact verdichtet, /clear leert. Das Verzeichnis bleibt in beiden Fällen." : ""));
+        await send(teil1 + "\n\n" + verbrauchsBericht());
         continue;
       }
 

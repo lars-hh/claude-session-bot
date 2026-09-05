@@ -1,20 +1,21 @@
-# Claude Code per Telegram fernsteuern
+# Claude Code per Telegram fernsteuern — Fork für LXC 112
 
-Ein Telegram-Bot, der Claude-Code-Sessions auf einem Linux-Server steuert — Sessions vom Handy eröffnen, Aufträge geben, Berechtigungen per Button freigeben. Zwei Node-Scripts, null Dependencies, kein offener Port.
+Ein Telegram-Bot, der Claude-Code-Sessions auf einem Linux-Server steuert: Sessions vom Handy eröffnen, Aufträge geben, Berechtigungen per Button freigeben. Zwei Node-Scripts, null Dependencies, kein offener Port.
 
-**Ausführliche Anleitung als Website:** https://alphagenx.github.io/claude-telegram-session-bot/
+**Dies ist ein Fork** von [AlphaGenX/claude-telegram-session-bot](https://github.com/AlphaGenX/claude-telegram-session-bot) (MIT), betrieben auf LXC 112 `claude-dev`. Was gegenüber dem Original geändert wurde und **warum**, steht vollständig in **[AENDERUNGEN.md](AENDERUNGEN.md)** — inklusive der Punkte, die auch upstream nützlich wären.
 
-## Features
+Der Zweck hier ist **Verfügbarkeit, nicht Bequemlichkeit**: der Bot ist die Rückfalllinie an die eigenen Maschinen, wenn kein anderer Weg offen ist. Daraus folgen der Vollmodus als Default, der PR als einzige verbliebene Kontrollstelle und die externe Überwachung.
 
-- Jede Telegram-Nachricht ist ein Auftrag an die aktive Claude-Session — mit vollem Gesprächsgedächtnis
-- Sessions eröffnen, wechseln, auflisten, beenden: `/neu`, `/sessions`, `/wechsel`, `/clear`, `/ende`
-- Projektverzeichnis je Session wählbar: `/projekte`, `/neu <projekt> [Auftrag]`
-- Berechtigungsmodus je Session: `/modus standard|edits|plan|voll` (wie das Shift+Tab-Menü in Claude Code)
-- Sprachmodell je Session: `/modell opus|sonnet|haiku|standard` — Bauaufträge auf Opus, schnelle Handgriffe auf Haiku
-- Braucht Claude eine Berechtigung (z. B. Shell), kommt eine Telegram-Anfrage mit **Erlauben/Ablehnen-Buttons**; die Nachricht zeigt danach sichtbar ERLAUBT / ABGELEHNT / ABGELAUFEN
-- `/status` liefert den fertigen SSH-Befehl, um jede Session am Rechner als volle interaktive Claude-Code-Sitzung fortzusetzen
-- Web-Suche (`WebSearch`/`WebFetch`) ist fest erlaubt
-- Nur die eigene Telegram-Chat-ID wird akzeptiert; Long Polling, keine offenen Ports
+## Was dieser Fork zusätzlich kann
+
+- **`/neu <repo> [Auftrag]` klont, registriert und startet in einem Zug** — mit unscharfer Namenssuche über die eigenen GitHub-Repos. `sessionbot` findet `claude-session-bot`, `geldwrk` fragt nach `geldwerk`. Nie einen Pfad tippen
+- **Branch + Pull Request als Default für jedes Projekt.** Der Bot legt den Branch an, *bevor* Claude läuft, und öffnet danach den PR. `/direkt` ist die Ausnahme pro Session
+- **Die Warteschlange überlebt einen Neustart** und fragt beim Start nach, statt Aufträge still zu verschlucken
+- **Timeout 2 Stunden** statt 30 Minuten, und ein Abbruch wird als Zwischenstand gemeldet — der PR entsteht trotzdem
+- **Capability-Ping an healthchecks.io:** alle 30 Minuten ein winziges `claude -p`, gepingt wird nur bei `is_error: false`
+- **`/compact`** verdichtet den Kontext der aktiven Session, mit Gegenprobe am Transkript
+- **`/rc [projekt]`** öffnet eine echte Remote-Control-Sitzung und schickt die `claude.ai`-Adresse in den Chat — volle Claude-Code-Oberfläche auf dem Handy
+- Antworten kommen **formatiert** an (Markdown → Telegram-HTML) statt mit rohen Sternchen, und der Bot meldet ein **Befehlsmenü** bei Telegram an
 
 ## Wie es funktioniert
 
@@ -25,89 +26,80 @@ claude -p "Auftrag" --output-format json          # liefert session_id
 claude -p "Folgeauftrag" --resume <session_id>    # setzt fort
 ```
 
-Wichtig: `--resume` liefert je Aufruf eine **neue** Session-ID (Fork) — der Bot übernimmt sie automatisch ins Register (`/root/.claude-sessions.json`).
+Berechtigungen delegiert Claude Code per `--permission-prompt-tool` an einen Mini-MCP-Server (`permission-mcp.mjs`), der die Anfrage als Telegram-Buttons stellt und bis zu 5 Minuten auf den Klick wartet.
 
-Berechtigungen delegiert Claude Code per `--permission-prompt-tool` an einen Mini-MCP-Server (`permission-mcp.mjs`), der die Anfrage als Telegram-Buttons stellt und bis zu 5 Minuten auf den Klick wartet. **Stolperfalle:** Claude Code bricht MCP-Aufrufe standardmäßig nach ~30 s ab — deshalb setzt der Bot `MCP_TOOL_TIMEOUT=360000`. Ohne diesen Wert läuft jede Freigabe ins Leere.
+Drei Dinge, die man kennen muss — alle drei am 2026-09-05 auf Claude Code **2.1.260** nachgemessen:
 
-Zwei Eigenheiten, die man kennen sollte:
-- Harmlose read-only-Befehle (`uptime`, `ls` …) führt Claude Code ohne Anfrage aus — gewollt, keine Button-Flut
-- Im Modus `edits` (Standard) sind Dateiänderungen bewusst freigegeben; wer jede Änderung bestätigen will, nimmt `/modus standard`
+- **`is_error` prüfen, nie den Exit-Code.** `claude -p` meldet API-Fehler mit Exit 0 **und** `subtype: "success"`; der Fehlertext steht in `result`. Wer das nicht prüft, schickt „Failed to authenticate…" als vermeintliche Claude-Antwort in den Chat, und der Dienst wirkt dabei monatelang gesund.
+- **Der Idle-Timeout ist der Killer, nicht der Startup-Timeout.** `MCP_TOOL_TIMEOUT` ist der Startup-Wert; was einen wartenden Freigabe-Prompt abschneidet, ist `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (Default 1800 s bei stdio-Servern).
+- **`--resume` behält die Session-ID.** Über vier aufeinanderfolgende `--resume`-Läufe blieb `session_id` unverändert — die Annahme „jeder Aufruf forkt eine neue ID" trifft auf dieser Version nicht zu. Der Bot übernimmt eine geänderte ID trotzdem, falls sich das wieder ändert.
 
-## Installation
+Und eine Falle, die hier dreimal zugeschlagen hat: **eine interaktive Claude-Sitzung darf man nicht umleiten.** Pipe, `tee` oder Logdatei nehmen ihr das TTY, sie fällt auf `--print` zurück und stirbt mit „Input must be provided…". Genau das trieb einen Vorgänger-Dienst in 23.457 Neustarts.
 
-Voraussetzungen: Linux-Server (getestet: Ubuntu 24.04), Node.js 22+, [Claude Code](https://code.claude.com/docs/en/setup) installiert und angemeldet (Pro/Max-Abo). Die Scripts nehmen Betrieb als `root` an — Pfade sonst anpassen.
+## Betrieb auf LXC 112
 
-> **Wichtig:** Unter root verweigert Claude Code den Modus `voll` (`bypassPermissions`) grundsätzlich — die anderen drei Modi laufen normal. Wer `voll` braucht, betreibt Bot und Claude als eigenen unprivilegierten Benutzer (Unit mit `User=`, Pfade von `/root/…` auf das Home des Benutzers umstellen, Claude-Login unter diesem Benutzer). Angenehmer Nebeneffekt: Ein kompromittierter Bot hat keine root-Rechte.
+| | |
+|---|---|
+| Container | `claude-dev`, Debian 12, unprivileged, 4 Cores, 8 GB |
+| Benutzer | `claude` (**nicht** root — sonst verweigert Claude Code `bypassPermissions`) |
+| Scripts | `/home/claude/bin/telegram-session.mjs`, `permission-mcp.mjs`, `perm-mcp.json`, Mode 700 |
+| Konfiguration | `/home/claude/.config/telegram-session.env` (`BOT_TOKEN`, `CHAT_ID`, optional `HC_URL`) |
+| Projektregister | `/home/claude/.config/claude-projekte.json`, Repo-Katalog `claude-repos.json` |
+| Sessions + Warteschlange | `/home/claude/.claude-sessions.json` |
+| Dienst | `claude-session-bot.service` — `systemctl status\|restart claude-session-bot` |
+| Logs | `journalctl -u claude-session-bot -f` |
+| Arbeitsverzeichnis | `/home/claude/work/<repo>` — `/neu` legt die Klone selbst dort an |
+| Remote-Control-Sitzungen | tmux, Namen `rc-<projekt>` |
 
-**Vorbereitung (2 Minuten):**
-1. In Telegram `@BotFather` anschreiben: `/newbot` → Token notieren
-2. Dem neuen Bot einmal `/start` schicken
-3. Chat-ID auslesen: `curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates"` → Wert `chat.id`
+**Nach jedem Deploy prüfen:** `systemctl show claude-session-bot -p NRestarts` muss `0` bleiben. Ein hochzählender Wert ist ein Crash-Loop, kein Schönheitsfehler.
 
-**Schnellweg:**
-
-```bash
-git clone https://github.com/AlphaGenX/claude-telegram-session-bot.git
-cd claude-telegram-session-bot
-sudo bash install.sh          # fragt Token, Chat-ID, Hostname, Arbeitsverzeichnis ab
-```
-
-**Manuell:** Die Dateien tun genau das, was der Installer automatisiert:
-
-| Datei | Ziel | Anmerkung |
-|---|---|---|
-| `telegram-session.mjs` | `/root/bin/` | `HOST`-Konstante auf eigenen Servernamen setzen, `chmod +x` |
-| `permission-mcp.mjs` | `/root/bin/` | `chmod +x` |
-| `perm-mcp.json` | `/root/bin/` | MCP-Registrierung für den Freigabe-Server |
-| `telegram-session.env.example` | `/root/.config/telegram-session.env` | Token und Chat-ID eintragen, `chmod 600` |
-| `claude-projekte.json.example` | `/root/.config/claude-projekte.json` | Kurzname → Verzeichnis |
-| `telegram-session.service` | `/etc/systemd/system/` | dann `systemctl daemon-reload && systemctl enable --now telegram-session` |
-
-**Testfolge in Telegram:**
-1. `/start` → Hilfe
-2. „Wie ist das Wetter in Hamburg?" → erste Session, Antwort mit Websuche
-3. „Führe uptime aus" → läuft ohne Nachfrage (read-only)
-4. „Lege /root/test per touch an" → Freigabe-Button, nach Erlauben wird ausgeführt
+**Externe Überwachung scharf stellen:** Check auf healthchecks.io anlegen (Periode 30 Min, Grace 20 Min), Ping-URL als `HC_URL=` in die env, Dienst neu starten. Fehlt sie, läuft der Bot normal weiter, protokolliert das aber als `Capability-Ping UNSCHARF` und sagt es in `/status` — der unscharfe Zustand soll sichtbar sein, nicht still.
 
 ## Befehle
 
 | Befehl | Wirkung |
 |---|---|
 | *(Nachricht)* | Auftrag an die aktive Session; ohne aktive wird eine neue eröffnet |
-| `/neu [projekt\|/pfad] [Auftrag]` | Neue Session, Verzeichnis wählbar |
-| `/projekte` / `/projekte add name /pfad` | Verzeichnisse anzeigen / registrieren |
-| `/modus [standard\|edits\|plan\|voll]` | Berechtigungsmodus anzeigen bzw. setzen (`voll` braucht einen Nicht-root-Betrieb) |
-| `/modell [opus\|sonnet\|haiku\|standard]` | Sprachmodell anzeigen bzw. setzen; gilt ab dem nächsten Auftrag |
-| `/sessions` | Alle Sessions mit Verzeichnis, Modus und Modell |
-| `/wechsel N` | Aktive Session wechseln |
-| `/status` | Stand + SSH-Befehl zum Fortsetzen am Rechner |
-| `/clear` | Kontext leeren, frisch im selben Verzeichnis |
-| `/ende` | Session ablegen (Transkript bleibt unter `~/.claude/projects/`) |
+| `/neu [repo\|projekt\|/pfad] [Auftrag]` | Projekt öffnen — klont bei Bedarf, unscharfer Name erlaubt |
+| `/rc [projekt]` · `/rc liste` · `/rc stop` | Remote-Control-Sitzung öffnen, auflisten, beenden |
+| `/direkt [aus]` | Für diese Session direkt auf dem Hauptbranch statt Branch + PR |
+| `/compact` | Kontext der aktiven Session verdichten |
+| `/projekte` · `add` · `scan` · `repos` | Verzeichnisse zeigen, registrieren, übernehmen, Repo-Liste neu einlesen |
+| `/modus [standard\|edits\|plan\|auto\|voll]` | Berechtigungsmodus (Default hier: `voll`) |
+| `/modell [opus\|sonnet\|haiku\|standard]` | Sprachmodell je Session |
+| `/sessions` · `/wechsel N` | Sessions auflisten und wechseln |
+| `/status` | Stand, Branch, PR, Außenwache, SSH-Befehl zum Fortsetzen |
+| `/clear` · `/ende` | Kontext leeren bzw. Session ablegen (Transkript bleibt) |
 
 ## Stellschrauben
 
 | Wo | Was | Bedeutung |
 |---|---|---|
 | `telegram-session.env` | `BOT_TOKEN`, `CHAT_ID` | Zugang; die Chat-ID ist die einzige Schranke |
-| `telegram-session.mjs` | `DEFAULT_CWD`, `HOST` | Standard-Verzeichnis, Servername für `/status` |
-| `telegram-session.mjs` | `MCP_TOOL_TIMEOUT: "360000"` | Muss größer sein als die Button-Wartezeit |
-| `telegram-session.mjs` | `MODELLE` | Modell-IDs hinter `/modell` — bei neuen Claude-Versionen anpassen |
+| `telegram-session.env` | `HC_URL` | Ping-Ziel der Außenwache; leer = unscharf, wird laut protokolliert |
+| `telegram-session.mjs` | `DEFAULT_MODE` | hier `bypassPermissions` — bewusste Entscheidung, siehe unten |
+| `telegram-session.mjs` | `RUN_TIMEOUT` | 2 h je Auftrag |
+| `telegram-session.mjs` | `HC_INTERVAL` | Abstand der Fähigkeits-Prüfung (30 Min) |
+| `telegram-session.mjs` | `GH_USER`, `REPO_CACHE_TTL` | Repo-Katalog für die unscharfe Suche |
+| `telegram-session.mjs` | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` | muss größer sein als die Button-Wartezeit |
 | `permission-mcp.mjs` | `300000` in `frage()` | Wartezeit auf den Button (5 Min), danach abgelehnt |
-| `claude-projekte.json` | Name → Pfad | Projekt-Kurznamen für `/neu` |
 
 ## Sicherheit
 
-- Die **Chat-ID-Whitelist ist die einzige Schranke** — Token geheim halten, Bot-Namen nicht öffentlich teilen. Bei Verdacht: `/revoke` bei @BotFather, neuen Token in die env, Dienst neu starten
-- Keine offenen Ports nötig: Long Polling nutzt nur ausgehende HTTPS-Verbindungen
-- Wer dem Bot schreiben darf, gibt Claude Aufträge mit Schreibzugriff auf den Server — entsprechend behandeln
-- **Empfehlung:** Bot und Claude als eigenen unprivilegierten Benutzer betreiben statt als root — begrenzt den Schaden eines missbrauchten Zugangs und schaltet nebenbei den Modus `voll` frei
+- Die **Chat-ID-Whitelist ist die einzige Schranke**. Token geheim halten. Bei Verdacht: `/revoke` bei @BotFather, neuen Token in die env, Dienst neu starten
+- `BOT_TOKEN` und `CHAT_ID` werden aus der Umgebung des Claude-Subprozesses **gestrippt** — sonst könnte ein per Prompt Injection gekaperter Agent über den vorgesehenen Kanal mit dem vorgesehenen Token exfiltrieren. Mit Firewall-Regeln nicht zu schließen
+- Der Freigabe-MCP kennt **keinen** Token; er tauscht Dateien mit dem Bot aus
+- Keine offenen Ports: Long Polling nutzt nur ausgehende HTTPS-Verbindungen
+- **`DEFAULT_MODE = "bypassPermissions"` ist eine Entscheidung für diese Maschine, keine Empfehlung.** Der Blast-Radius ist gemessen und akzeptiert (der Benutzer `claude` hat passwortloses `sudo` und ist in der `docker`-Gruppe). Für die meisten Installationen ist der Upstream-Default `acceptEdits` richtiger. Der PR-Diff ist im Vollmodus die einzige verbliebene Kontrollstelle — deshalb ist Branch + PR hier Default und nicht Option
 
 ## Versionen
 
-- **v6.1** (2026-09-04): stdin des Claude-Prozesses wird sofort geschlossen (spart 3 Sekunden Wartezeit je Auftrag); Fehlermeldungen zeigen das Ende der Meldung statt des Kommando-Echos — da steht die Ursache
-- **v6** (2026-09-04): `/modell`-Befehl, Sprachmodell je Session
-- **v5** (2026-09-03): Erstveröffentlichung — Session-Verwaltung, Projektverzeichnisse, Freigabe-Buttons mit sichtbarem Feedback, `/modus`
+- **v8.2** (2026-09-05): `/rc` öffnet eine Remote-Control-Sitzung und schickt die Adresse
+- **v8.1** (2026-09-05): Markdown-Formatierung, Umlaute, Befehlsmenü, keine leeren Branches mehr
+- **v8** (2026-09-05): `/neu` mit Auto-Klonen und unscharfer Suche · Branch + PR als Default · persistente Warteschlange · Timeout 2 h · Capability-Ping · `/compact`
+- **v7** (2026-09-04): sechs Korrekturen gegenüber Upstream v6.1, tokenloser Freigabe-Relay, Pfade auf Benutzer `claude` — siehe [AENDERUNGEN.md](AENDERUNGEN.md)
+- Ältere Versionen: Historie des Originals
 
 ## Lizenz
 
-MIT — siehe [LICENSE](LICENSE).
+MIT — siehe [LICENSE](LICENSE). Ursprung: [AlphaGenX/claude-telegram-session-bot](https://github.com/AlphaGenX/claude-telegram-session-bot).

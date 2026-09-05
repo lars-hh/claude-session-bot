@@ -7,6 +7,34 @@ Container, User `claude`, Claude Code 2.1.260).
 Diese Datei hält fest, **was geändert wurde und warum** — und markiert, was davon nicht an unsere
 Umgebung gebunden ist und deshalb upstream nützlich wäre.
 
+## Stand gegenüber dem Original (geprüft 2026-09-05)
+
+Abzweigpunkt: `0ac515f` — Upstream v6.1 vom 2026-09-04.
+
+| | |
+|---|---|
+| Original voraus | **2 Commits** |
+| Dieser Fork voraus | **4 Commits** |
+| Einziger Autor upstream | `AlphaGenX` |
+
+**Was im Original seither dazukam:**
+
+- `f9f7721` **v7: `/usage`** — Kontext-Verbrauch der aktiven Session, gelesen aus dem
+  Session-Transkript (letzte `assistant`-Zeile, Subagenten ausgefiltert), Kontextfenster je Lauf aus
+  dem Result-JSON gemerkt statt hartcodiert. Anzeige mit Balken und Prozent, ab 70 % Hinweis auf
+  `/clear`. Kostet keinen Claude-Lauf.
+- `92825a4` Executable-Bit von `telegram-session.mjs` wiederhergestellt.
+
+**Bewertung:** `/usage` ist übernehmenswert und liegt genau auf dem Weg von **Bauteil 3** (Fortschritt
+aus dem Live-Transkript) — beide lesen `~/.claude/projects/<slug>/<id>.jsonl`, nur mit anderer
+Fragestellung. Ein direkter Cherry-Pick ist nicht sinnvoll: die Pfade zeigen auf `/root`, und die
+Ausgabe müsste durch unsere Formatierungsschicht. Sinnvoller ist, die Transkript-Leserei **einmal**
+zu bauen und beides daraus zu bedienen.
+
+Umgekehrt sind vier Punkte aus diesem Fork **upstream-relevant** und unten je einzeln markiert
+(Punkte 1–4). Sie gehören als schmale Branches von `upstream/main` eingereicht, nicht als dieser
+Fork — der trägt Pfade und Betriebsentscheidungen, die nur hier gelten.
+
 ## 1. `permission-mode "default"` existiert nicht mehr → `"manual"`
 
 ```diff
